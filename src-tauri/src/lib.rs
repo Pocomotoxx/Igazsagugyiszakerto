@@ -405,6 +405,25 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// Maszkolja a mentett API-kulcsokat egy hiba-/naplószövegben, mielőtt az a
+/// felhasználóhoz vagy az audit_logs-ba kerül (SEC-1). A rövid/üres kulcsot sose
+/// cseréli, hogy ne maszkoljon el ártatlan szövegrészt.
+fn redact_secrets(input: &str, settings: &AppSettings) -> String {
+    let mut out = input.to_string();
+    for secret in [
+        &settings.api_key,
+        &settings.google_cse_key,
+        &settings.brave_key,
+        &settings.tavily_key,
+    ] {
+        let s = secret.trim();
+        if s.len() >= 6 {
+            out = out.replace(s, "***");
+        }
+    }
+    out
+}
+
 fn default_app_settings() -> AppSettings {
     AppSettings {
         search_mode: "native".to_string(),
@@ -921,8 +940,9 @@ Legyen 5-8 javaslat. Ha nincs konkret URL, adj Google kereses URL-t vagy hagyd u
         "gemini" => {
             let response = client
                 .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                 ))
+                .header("x-goog-api-key", api_key)
                 .header("Content-Type", "application/json")
                 .json(&json!({
                     "systemInstruction": {
@@ -2381,6 +2401,7 @@ fn execute_search_blocking(
                     );
                 }
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     tavily_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2405,6 +2426,7 @@ fn execute_search_blocking(
                     );
                 }
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     brave_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2436,6 +2458,7 @@ fn execute_search_blocking(
                     );
                 }
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     cse_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2459,6 +2482,7 @@ fn execute_search_blocking(
             match add_ai_results(&mut results, 0, trimmed, &settings) {
                 Ok(brief) => ai_brief = brief,
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     ai_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2882,6 +2906,34 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_secrets_masks_configured_keys() {
+        let mut settings = default_app_settings();
+        settings.google_cse_key = "AIzaSyTESTKEY1234567890".to_string();
+        let message = "Google CSE hivas sikertelen: key=AIzaSyTESTKEY1234567890 (HTTP 403)";
+        let redacted = redact_secrets(message, &settings);
+        assert!(!redacted.contains("AIzaSyTESTKEY1234567890"));
+        assert!(redacted.contains("***"));
+    }
+
+    #[test]
+    fn redact_secrets_ignores_empty_and_short_keys() {
+        let mut settings = default_app_settings();
+        settings.api_key = String::new();
+        settings.brave_key = "abc".to_string();
+        let message = "Hiba: abc tortent, nincs kulcs";
+        assert_eq!(redact_secrets(message, &settings), message);
+    }
+
+    #[test]
+    fn redact_secrets_masks_all_occurrences() {
+        let mut settings = default_app_settings();
+        settings.tavily_key = "tvly-SECRETVALUE99".to_string();
+        let message = "tvly-SECRETVALUE99 ... ismet tvly-SECRETVALUE99";
+        let redacted = redact_secrets(message, &settings);
+        assert!(!redacted.contains("tvly-SECRETVALUE99"));
+    }
 
     #[test]
     fn normalize_for_match_strips_hungarian_accents() {
