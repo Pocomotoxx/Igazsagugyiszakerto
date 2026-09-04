@@ -1,0 +1,13 @@
+[package]
+name = "alloc-stdlib"
+version = "0.2.4"
+edition = "2021"
+authors = ["Daniel Reiter Horn <danielrh@dropbox.com>"]
+description = "Patched local copy for offline-compatible Tauri build"
+license = "BSD-3-Clause"
+
+[dependencies]
+alloc-no-stdlib = "2.0.4"
+
+[features]
+unsafe = ["alloc-no-stdlib/unsafe"]

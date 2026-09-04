@@ -1,0 +1,39 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.db
+build_output/
+irbr_database.db
+
+# Python előtanulmány maradéka
+__pycache__/
+*.pyc
+
+# Nem forráskód / ügyadat (nem publikálandó)
+mezogazdasagi_gepi_munkak_koltsege_2020_ban_20_04.pdf
+cse-annotations.xml
+
+# Build-kimenetek / binárisok (nem forráskód)
+build/
+release/
