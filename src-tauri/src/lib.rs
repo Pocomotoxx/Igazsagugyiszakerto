@@ -9,7 +9,9 @@ use std::path::Path;
 use std::io::Read;
 use std::io::Write;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use tauri::Manager;
 
 const MAX_SEARCH_QUERY_LEN: usize = 2000;
@@ -445,6 +447,62 @@ fn default_app_settings() -> AppSettings {
     }
 }
 
+/// Megosztott, 30 s-os HTTP-kliens a keresési providerekhez (PERF-1).
+fn search_client() -> Result<&'static Client, String> {
+    static CELL: OnceLock<Client> = OnceLock::new();
+    if let Some(c) = CELL.get() {
+        return Ok(c);
+    }
+    let c = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let _ = CELL.set(c);
+    Ok(CELL.get().expect("just set"))
+}
+
+/// Megosztott, 45 s-os HTTP-kliens az AI-hívásokhoz (PERF-1).
+fn ai_client() -> Result<&'static Client, String> {
+    static CELL: OnceLock<Client> = OnceLock::new();
+    if let Some(c) = CELL.get() {
+        return Ok(c);
+    }
+    let c = Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let _ = CELL.set(c);
+    Ok(CELL.get().expect("just set"))
+}
+
+fn archive_dir_for(db_path: &str) -> PathBuf {
+    Path::new(db_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("archive")
+}
+
+/// true, ha a `candidate` az archive mappán belül van (kanonizált út-összevetés, SEC-3).
+fn is_within_archive(db_path: &str, candidate: &str) -> bool {
+    let base = match archive_dir_for(db_path).canonicalize() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    match Path::new(candidate).canonicalize() {
+        Ok(c) => c.starts_with(&base),
+        Err(_) => false,
+    }
+}
+
+/// A PowerShell spawn-hibáját érthető üzenetre képezi (DPAPI Windows-kötöttség, PLAT-1).
+fn map_powershell_spawn_error(kind: std::io::ErrorKind, raw: &str) -> String {
+    if kind == std::io::ErrorKind::NotFound {
+        "A titkos kulcsok titkosítása Windows PowerShellt (DPAPI) igényel, ami ezen a rendszeren nem található. A kulcs nem menthető biztonságosan.".to_string()
+    } else {
+        format!("PowerShell futtatási hiba: {raw}")
+    }
+}
+
 fn run_powershell_with_stdin(script: &str, stdin_payload: &str) -> Result<String, String> {
     let mut child = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])
@@ -452,7 +510,7 @@ fn run_powershell_with_stdin(script: &str, stdin_payload: &str) -> Result<String
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("PowerShell futtatasi hiba: {e}"))?;
+        .map_err(|e| map_powershell_spawn_error(e.kind(), &e.to_string()))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -912,10 +970,7 @@ fn request_ai_search_response(
 Legyen 5-8 javaslat. Ha nincs konkret URL, adj Google kereses URL-t vagy hagyd uresen."
     );
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializalasi hiba: {e}"))?;
+    let client = ai_client()?;
 
     let response_text = match provider {
         "openrouter" => {
@@ -1149,10 +1204,7 @@ fn add_cse_results(
     api_key: &str,
     cx: &str,
 ) -> Result<usize, String> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let client = search_client()?;
 
     let response = client
         .get("https://www.googleapis.com/customsearch/v1")
@@ -1215,10 +1267,7 @@ fn add_brave_results(
     query: &str,
     api_key: &str,
 ) -> Result<usize, String> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let client = search_client()?;
 
     let response = client
         .get("https://api.search.brave.com/res/v1/web/search")
@@ -1288,10 +1337,7 @@ fn add_tavily_results(
     query: &str,
     api_key: &str,
 ) -> Result<usize, String> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let client = search_client()?;
 
     let (effective_query, site_domains) = split_query_for_domain_search(query);
 
@@ -1967,6 +2013,16 @@ fn delete_case(state: tauri::State<'_, DbState>, id: i64) -> Result<String, Stri
 
     let mut failed_files = 0usize;
     for path in &file_paths {
+        if !is_within_archive(&state.db_path, path) {
+            let _ = log_action(
+                &state.db_path,
+                id,
+                "case_file_delete_skipped_out_of_scope",
+                path,
+                "Törlés kihagyva: a fájl az archive mappán kívül esik.",
+            );
+            continue;
+        }
         match fs::remove_file(path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2047,19 +2103,29 @@ fn delete_source(state: tauri::State<'_, DbState>, id: i64) -> Result<String, St
         .map_err(|e| e.to_string())?;
 
     if !file_path.is_empty() {
-        match fs::remove_file(&file_path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                log_action(
-                    &state.db_path,
-                    case_id,
-                    "source_deletion_error",
-                    &id.to_string(),
-                    &format!("Forrásfájl törlése sikertelen: {file_path}. Hiba: {error}"),
-                )?;
-                return Err(format!("A forrásfájl törlése sikertelen: {error}"));
+        if is_within_archive(&state.db_path, &file_path) {
+            match fs::remove_file(&file_path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log_action(
+                        &state.db_path,
+                        case_id,
+                        "source_deletion_error",
+                        &id.to_string(),
+                        &format!("Forrásfájl törlése sikertelen: {file_path}. Hiba: {error}"),
+                    )?;
+                    return Err(format!("A forrásfájl törlése sikertelen: {error}"));
+                }
             }
+        } else {
+            log_action(
+                &state.db_path,
+                case_id,
+                "source_file_delete_skipped_out_of_scope",
+                &id.to_string(),
+                &format!("Törlés kihagyva: a fájl az archive mappán kívül esik: {file_path}"),
+            )?;
         }
     }
 
@@ -3016,6 +3082,43 @@ mod tests {
         let message = "tvly-SECRETVALUE99 ... ismet tvly-SECRETVALUE99";
         let redacted = redact_secrets(message, &settings);
         assert!(!redacted.contains("tvly-SECRETVALUE99"));
+    }
+
+    #[test]
+    fn search_and_ai_clients_are_reused() {
+        assert!(std::ptr::eq(search_client().unwrap(), search_client().unwrap()));
+        assert!(std::ptr::eq(ai_client().unwrap(), ai_client().unwrap()));
+    }
+
+    #[test]
+    fn map_powershell_spawn_error_explains_missing_powershell() {
+        let missing = map_powershell_spawn_error(std::io::ErrorKind::NotFound, "not found");
+        assert!(missing.contains("DPAPI") && missing.contains("PowerShell"));
+        let other = map_powershell_spawn_error(std::io::ErrorKind::PermissionDenied, "boom");
+        assert!(other.contains("boom"));
+    }
+
+    #[test]
+    fn is_within_archive_allows_only_archive_files() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("irbr_sec3_test_{}", std::process::id()));
+        let archive = base.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let db_path = base.join("irbr_database.db");
+        fs::write(&db_path, b"x").unwrap();
+        let inside = archive.join("src_1.txt");
+        fs::write(&inside, b"a").unwrap();
+        let outside = base.join("titok.txt");
+        fs::write(&outside, b"b").unwrap();
+
+        let db = db_path.to_string_lossy().into_owned();
+        assert!(is_within_archive(&db, &inside.to_string_lossy()));
+        assert!(!is_within_archive(&db, &outside.to_string_lossy()));
+        let traversal = archive.join("..").join("titok.txt");
+        assert!(!is_within_archive(&db, &traversal.to_string_lossy()));
+        assert!(!is_within_archive(&db, &archive.join("nincs.txt").to_string_lossy()));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
