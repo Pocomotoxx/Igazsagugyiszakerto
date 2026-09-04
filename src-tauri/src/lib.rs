@@ -235,31 +235,6 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN preliminary_opinion TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN final_opinion TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN report_status TEXT NOT NULL DEFAULT 'tervezet'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN finalizable TEXT NOT NULL DEFAULT 'nem'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN open_questions TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN closed_points TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-
     conn.execute(
         "CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -303,60 +278,6 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let _ = conn.execute("ALTER TABLE sources ADD COLUMN search_run_id INTEGER", []);
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN original_url TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN archived_url TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN snapshot_timestamp TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN archive_kind TEXT NOT NULL DEFAULT 'live'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN source_status TEXT NOT NULL DEFAULT 'nyers'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN priority_level INTEGER NOT NULL DEFAULT 2",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN usability_decision TEXT NOT NULL DEFAULT 'hatteranyag'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN proof_summary TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN reviewer_name TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN relevance_note TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN probative_value TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN missing_points TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-
     conn.execute(
         "CREATE TABLE IF NOT EXISTS search_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,11 +294,6 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
-
-    let _ = conn.execute(
-        "ALTER TABLE search_runs ADD COLUMN note TEXT NOT NULL DEFAULT ''",
-        [],
-    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS app_settings (
@@ -404,6 +320,91 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    migrate_schema(conn)?;
+
+    Ok(())
+}
+
+const SCHEMA_VERSION: i64 = 1;
+
+/// true, ha a `table` tartalmazza a `column` oszlopot. A `table`/`column`
+/// kizárólag kódban rögzített literál lehet (nincs felhasználói input) → nincs SQLi.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let name: String = row.get(1).map_err(|e| e.to_string())?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Hozzáadja az oszlopot, ha hiányzik. A valódi hibák propagálnak (nincs elnyelés).
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_def: &str,
+) -> Result<(), String> {
+    if table_has_column(conn, table, column)? {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}"),
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Verziózott, determinisztikus séma-migráció. A `PRAGMA user_version` kapun áll:
+/// ha a DB már a célverzión van, nem végez séma-műveletet.
+fn migrate_schema(conn: &Connection) -> Result<(), String> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    for (col, def) in [
+        ("preliminary_opinion", "TEXT NOT NULL DEFAULT ''"),
+        ("final_opinion", "TEXT NOT NULL DEFAULT ''"),
+        ("report_status", "TEXT NOT NULL DEFAULT 'tervezet'"),
+        ("finalizable", "TEXT NOT NULL DEFAULT 'nem'"),
+        ("open_questions", "TEXT NOT NULL DEFAULT ''"),
+        ("closed_points", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        add_column_if_missing(conn, "cases", col, def)?;
+    }
+
+    add_column_if_missing(conn, "sources", "search_run_id", "INTEGER")?;
+    for (col, def) in [
+        ("original_url", "TEXT NOT NULL DEFAULT ''"),
+        ("archived_url", "TEXT NOT NULL DEFAULT ''"),
+        ("snapshot_timestamp", "TEXT NOT NULL DEFAULT ''"),
+        ("archive_kind", "TEXT NOT NULL DEFAULT 'live'"),
+        ("source_status", "TEXT NOT NULL DEFAULT 'nyers'"),
+        ("priority_level", "INTEGER NOT NULL DEFAULT 2"),
+        ("usability_decision", "TEXT NOT NULL DEFAULT 'hatteranyag'"),
+        ("proof_summary", "TEXT NOT NULL DEFAULT ''"),
+        ("reviewer_name", "TEXT NOT NULL DEFAULT ''"),
+        ("reviewed_at", "TEXT NOT NULL DEFAULT ''"),
+        ("relevance_note", "TEXT NOT NULL DEFAULT ''"),
+        ("probative_value", "TEXT NOT NULL DEFAULT ''"),
+        ("missing_points", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        add_column_if_missing(conn, "sources", col, def)?;
+    }
+
+    add_column_if_missing(conn, "search_runs", "note", "TEXT NOT NULL DEFAULT ''")?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3015,6 +3016,74 @@ mod tests {
         let message = "tvly-SECRETVALUE99 ... ismet tvly-SECRETVALUE99";
         let redacted = redact_secrets(message, &settings);
         assert!(!redacted.contains("tvly-SECRETVALUE99"));
+    }
+
+    #[test]
+    fn add_column_if_missing_adds_then_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE cases (id INTEGER PRIMARY KEY, title TEXT)", [])
+            .unwrap();
+        assert!(!table_has_column(&conn, "cases", "report_status").unwrap());
+        add_column_if_missing(&conn, "cases", "report_status", "TEXT NOT NULL DEFAULT 'tervezet'")
+            .unwrap();
+        assert!(table_has_column(&conn, "cases", "report_status").unwrap());
+        // második hívás no-op, hibamentes
+        add_column_if_missing(&conn, "cases", "report_status", "TEXT NOT NULL DEFAULT 'tervezet'")
+            .unwrap();
+    }
+
+    #[test]
+    fn add_column_if_missing_propagates_real_errors() {
+        let conn = Connection::open_in_memory().unwrap();
+        // nem létező tábla -> valódi hiba, NEM elnyelve
+        assert!(add_column_if_missing(&conn, "nem_letezo_tabla", "x", "TEXT").is_err());
+    }
+
+    #[test]
+    fn migrate_schema_upgrades_legacy_db_and_preserves_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE cases (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT, deadline TEXT, status TEXT, created_at TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, case_id INTEGER)", [])
+            .unwrap();
+        conn.execute("CREATE TABLE search_runs (id INTEGER PRIMARY KEY, case_id INTEGER)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO cases (title, description) VALUES ('Teszt ügy', 'leiras')",
+            [],
+        )
+        .unwrap();
+
+        migrate_schema(&conn).unwrap();
+
+        assert!(table_has_column(&conn, "cases", "report_status").unwrap());
+        assert!(table_has_column(&conn, "sources", "missing_points").unwrap());
+        assert!(table_has_column(&conn, "search_runs", "note").unwrap());
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let title: String = conn
+            .query_row("SELECT title FROM cases WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "Teszt ügy");
+    }
+
+    #[test]
+    fn migrate_schema_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE cases (id INTEGER PRIMARY KEY)", []).unwrap();
+        conn.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY)", []).unwrap();
+        conn.execute("CREATE TABLE search_runs (id INTEGER PRIMARY KEY)", []).unwrap();
+        migrate_schema(&conn).unwrap();
+        migrate_schema(&conn).unwrap(); // no-op a user_version kapun
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
