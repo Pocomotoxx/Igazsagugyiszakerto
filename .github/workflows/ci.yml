@@ -1,0 +1,39 @@
+name: CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+
+  rust:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust eszközök
+        run: rustup component add rustfmt clippy
+      # Hard gate: a tesztek. A fmt és a clippy egyelőre informatív, mert a
+      # kiinduló kód még nem rustfmt-tiszta; egy külön formázási/lint-kör után
+      # tehetők hard gate-té (lásd ARCH-1).
+      - name: Tesztek
+        run: cargo test --locked
+      - name: Formátum-ellenőrzés (informatív)
+        run: cargo fmt --check
+        continue-on-error: true
+      - name: Clippy (informatív)
+        run: cargo clippy --all-targets
+        continue-on-error: true
