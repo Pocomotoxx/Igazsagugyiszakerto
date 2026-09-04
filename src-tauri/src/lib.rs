@@ -6,7 +6,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::io::Read;
 use std::io::Write;
+use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use tauri::Manager;
 
@@ -2789,6 +2791,63 @@ async fn fetch_page_text(url: String) -> Result<FetchedPage, String> {
         .map_err(|e| format!("Oldalletöltési belső hiba: {e}"))?
 }
 
+const MAX_FETCH_BYTES: u64 = 5 * 1024 * 1024;
+
+/// true, ha az IP belső/privát/loopback/link-local (SSRF-gát a fetch_page_text-hez).
+fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(&IpAddr::V4(mapped));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// A kérés előtt feloldja a hosztot, és elutasítja a belső/privát célt (SSRF-gát).
+fn ensure_host_allowed(url: &reqwest::Url) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let host = url.host_str().ok_or("Hiányzó hoszt az URL-ben.")?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err("Belső cím nem tölthető le.".to_string());
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("Névfeloldás sikertelen: {e}"))?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if is_blocked_ip(&addr.ip()) {
+            return Err("Belső vagy privát hálózati cím nem tölthető le.".to_string());
+        }
+    }
+    if !any {
+        return Err("A hoszt nem feloldható.".to_string());
+    }
+    Ok(())
+}
+
+/// Legfeljebb `max` bájtot olvas a válaszból (memória-korlát).
+fn read_body_capped<R: Read>(reader: R, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    reader.take(max).read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
 fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
     let parsed: reqwest::Url = url
         .parse()
@@ -2798,9 +2857,26 @@ fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
         return Err("Csak http vagy https URL tölthető le.".to_string());
     }
 
+    ensure_host_allowed(&parsed)?;
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) IRBR-archiver/0.1")
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let blocked = attempt
+                .url()
+                .host_str()
+                .map(|h| {
+                    h.eq_ignore_ascii_case("localhost")
+                        || h.parse::<IpAddr>().map(|ip| is_blocked_ip(&ip)).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if blocked {
+                attempt.error("blokkolt redirect cél")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
 
@@ -2809,11 +2885,17 @@ fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
         .send()
         .map_err(|e| format!("Az oldal letöltése sikertelen: {e}"))?;
 
+    if let Some(len) = response.content_length() {
+        if len > MAX_FETCH_BYTES {
+            return Err("A letöltendő tartalom túl nagy.".to_string());
+        }
+    }
+
     let status = response.status().as_u16();
     let final_url = response.url().to_string();
-    let body = response
-        .text()
+    let bytes = read_body_capped(response, MAX_FETCH_BYTES)
         .map_err(|e| format!("Az oldal tartalmának olvasása sikertelen: {e}"))?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let (title, text) = extract_text_from_html(&body);
 
@@ -2933,6 +3015,52 @@ mod tests {
         let message = "tvly-SECRETVALUE99 ... ismet tvly-SECRETVALUE99";
         let redacted = redact_secrets(message, &settings);
         assert!(!redacted.contains("tvly-SECRETVALUE99"));
+    }
+
+    #[test]
+    fn is_blocked_ip_blocks_internal_ranges() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.10",
+            "172.16.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                is_blocked_ip(&ip.parse::<IpAddr>().unwrap()),
+                "blokkolandó: {ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_ip_allows_public_addresses() {
+        for ip in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(
+                !is_blocked_ip(&ip.parse::<IpAddr>().unwrap()),
+                "engedélyezett: {ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_body_capped_enforces_limit() {
+        use std::io::Cursor;
+        let capped = read_body_capped(Cursor::new(vec![b'a'; 10]), 4).unwrap();
+        assert_eq!(capped.len(), 4);
+    }
+
+    #[test]
+    fn read_body_capped_returns_small_body_intact() {
+        use std::io::Cursor;
+        let data = vec![b'x'; 3];
+        let capped = read_body_capped(Cursor::new(data.clone()), 100).unwrap();
+        assert_eq!(capped, data);
     }
 
     #[test]
