@@ -2996,7 +2996,7 @@ mod tests {
     fn tier_filter_keeps_better_tiers() {
         let mut results = Vec::new();
         add_engine_launchers(&mut results, 0, "google", "teszt lekérdezés");
-        add_curated_sources(&mut results, 0, "teszt lekérdezés");
+        add_curated_sources(&mut results, 0, "teszt lekérdezés", &[]);
         let generated = results.len();
         assert!(generated > 0);
 
