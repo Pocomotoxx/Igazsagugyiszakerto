@@ -197,13 +197,12 @@ struct AiSearchResponse {
 #[derive(Deserialize, Debug)]
 struct AiSuggestion {
     title: Option<String>,
-    url: Option<String>,
     snippet: Option<String>,
     tier: Option<i32>,
-    source_type: Option<String>,
     relevance: Option<i32>,
     query_used: Option<String>,
-    action_label: Option<String>,
+    // A modell 'url'/'source_type'/'action_label' mezoit szandekosan nem hasznaljuk
+    // (a serde ignoralja): az AI-javaslat mindig keresesse alakul (FIX-AI-LINKS).
 }
 
 pub struct DbState {
@@ -957,6 +956,18 @@ fn fallback_result_url(query: &str) -> String {
     build_search_url("google", query)
 }
 
+/// Az AI-javaslatokhoz mindig valódi keresési URL-t ad a legpontosabb elérhető
+/// szövegre (query_used → title → alap lekérdezés). Így az AI által esetleg
+/// hallucinált nyers URL sosem jelenik meg találati linkként (FIX-AI-LINKS).
+fn ai_suggestion_url(query_used: Option<&str>, title: Option<&str>, base_query: &str) -> String {
+    let seed = query_used
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| title.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or(base_query);
+    fallback_result_url(seed)
+}
+
 fn request_ai_search_response(
     provider: &str,
     api_key: &str,
@@ -966,8 +977,8 @@ fn request_ai_search_response(
 ) -> Result<String, String> {
     let user_prompt = format!(
         "Keresesi feladat: {query}\n\nAdj vissza egy JSON objektumot ebben a formatumban: \
-{{\"search_brief\":\"...\",\"suggestions\":[{{\"title\":\"...\",\"url\":\"...\",\"snippet\":\"...\",\"tier\":2,\"source_type\":\"...\",\"relevance\":88,\"query_used\":\"...\",\"action_label\":\"...\"}}]}}. \
-Legyen 5-8 javaslat. Ha nincs konkret URL, adj Google kereses URL-t vagy hagyd uresen."
+{{\"search_brief\":\"...\",\"suggestions\":[{{\"title\":\"...\",\"snippet\":\"...\",\"tier\":2,\"source_type\":\"...\",\"relevance\":88,\"query_used\":\"...\",\"action_label\":\"...\"}}]}}. \
+Legyen 5-8 javaslat. NE adj meg URL-t es ne talalj ki linket; a 'query_used' mezobe adj pontos, lefuttathato keresokifejezest. A rendszer minden javaslathoz keresest nyit a kifejezesre."
     );
 
     let client = ai_client()?;
@@ -1130,11 +1141,9 @@ fn add_ai_results(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| query.to_string());
 
-        let url = item
-            .url
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| fallback_result_url(&item_query));
+        // FIX-AI-LINKS: az AI nyers url-jét sosem használjuk (gyakran hallucinált);
+        // mindig valódi keresést nyitunk a javasolt kifejezésre.
+        let url = ai_suggestion_url(item.query_used.as_deref(), item.title.as_deref(), query);
 
         push_detected_result(
             results,
@@ -1145,10 +1154,10 @@ fn add_ai_results(
                 .clone()
                 .unwrap_or_else(|| "AI altal javasolt keresesi vagy ellenorzesi lepés.".to_string()),
             item.tier.unwrap_or(2),
-            item.source_type.as_deref().unwrap_or("AI javaslat"),
+            "AI keresési javaslat",
             item.relevance.unwrap_or(80),
             item_query,
-            item.action_label.as_deref().unwrap_or("Megnyitas"),
+            "Keresés megnyitása",
         );
     }
 
@@ -3082,6 +3091,20 @@ mod tests {
         let message = "tvly-SECRETVALUE99 ... ismet tvly-SECRETVALUE99";
         let redacted = redact_secrets(message, &settings);
         assert!(!redacted.contains("tvly-SECRETVALUE99"));
+    }
+
+    #[test]
+    fn ai_suggestion_url_is_always_a_search_never_raw() {
+        // query_used elsőbbség, és mindig Google-keresés (nem nyers AI-URL)
+        let u = ai_suggestion_url(Some("mezőgazdasági óradíj 2020"), Some("Cím"), "alap");
+        assert!(u.contains("www.google.com/search?q="));
+        assert!(u.contains("2020"));
+        // üres query_used -> title
+        let u2 = ai_suggestion_url(Some("   "), Some("KSH statisztika"), "alap");
+        assert!(u2.contains("www.google.com/search?q="));
+        // egyik sincs -> alap lekérdezés
+        let u3 = ai_suggestion_url(None, None, "alap lekérdezés");
+        assert!(u3.contains("www.google.com/search?q="));
     }
 
     #[test]
