@@ -84,6 +84,10 @@ pub struct SearchResult {
     pub relevance: i32,
     pub query_used: String,
     pub action_label: String,
+    /// Provenance-szint: RETRIEVED (valódi kereső-API), CONSTRUCTED (épített
+    /// kereső/hivatalos URL), SUGGESTED (AI-javaslat), CAPTURED (rögzített).
+    #[serde(default)]
+    pub evidence_level: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -711,7 +715,16 @@ fn push_result(
             relevance,
             query_used,
             action_label: action_label.to_string(),
+            evidence_level: String::new(),
         });
+    }
+}
+
+/// A `from` indextől a végéig beállítja az evidence-szintet a most hozzáadott
+/// találatokra (KRISTA-alapelv: a provenance elsőrangú, találat-fajtánként).
+fn tag_evidence(results: &mut [SearchResult], from: usize, level: &str) {
+    for result in results.iter_mut().skip(from) {
+        result.evidence_level = level.to_string();
     }
 }
 
@@ -2463,10 +2476,13 @@ fn execute_search_blocking(
     let mut tavily_error: Option<String> = None;
 
     if effective_mode != "ai_only" {
+        let constructed_start = results.len();
         add_engine_launchers(&mut results, 0, engine, trimmed);
         add_curated_sources(&mut results, 0, trimmed, selected_source_packs);
         add_domain_specific_sources(&mut results, 0, trimmed, selected_source_packs);
+        tag_evidence(&mut results, constructed_start, "CONSTRUCTED");
 
+        let retrieved_start = results.len();
         if include_cse && !settings.tavily_key.trim().is_empty() {
             match add_tavily_results(&mut results, trimmed, settings.tavily_key.trim()) {
                 Ok(count) => {
@@ -2548,8 +2564,10 @@ fn execute_search_blocking(
                 }
             }
         }
+        tag_evidence(&mut results, retrieved_start, "RETRIEVED");
     }
 
+    let suggested_start = results.len();
     if effective_mode != "native" {
         if settings.api_key.trim().is_empty() {
             ai_error = Some(
@@ -2590,6 +2608,7 @@ fn execute_search_blocking(
             );
         }
     }
+    tag_evidence(&mut results, suggested_start, "SUGGESTED");
 
     let generated_count = results.len() as i32;
     if tier_filter > 0 {
@@ -3091,6 +3110,24 @@ mod tests {
         let message = "tvly-SECRETVALUE99 ... ismet tvly-SECRETVALUE99";
         let redacted = redact_secrets(message, &settings);
         assert!(!redacted.contains("tvly-SECRETVALUE99"));
+    }
+
+    #[test]
+    fn tag_evidence_only_tags_from_index_and_default_is_empty() {
+        let mut results = Vec::new();
+        push_result(
+            &mut results, 0, "a", "u".to_string(), String::new(), String::new(),
+            "live".to_string(), String::new(), String::new(), 3, "x", 50, "q".to_string(), "open",
+        );
+        assert_eq!(results[0].evidence_level, ""); // push_result default üres
+        let from = results.len();
+        push_result(
+            &mut results, 0, "b", "u2".to_string(), String::new(), String::new(),
+            "live".to_string(), String::new(), String::new(), 3, "x", 50, "q".to_string(), "open",
+        );
+        tag_evidence(&mut results, from, "RETRIEVED");
+        assert_eq!(results[0].evidence_level, ""); // korábbi érintetlen
+        assert_eq!(results[1].evidence_level, "RETRIEVED");
     }
 
     #[test]
