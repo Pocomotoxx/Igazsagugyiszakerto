@@ -6,8 +6,12 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
+use std::io::Read;
 use std::io::Write;
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use tauri::Manager;
 
 const MAX_SEARCH_QUERY_LEN: usize = 2000;
@@ -80,6 +84,10 @@ pub struct SearchResult {
     pub relevance: i32,
     pub query_used: String,
     pub action_label: String,
+    /// Provenance-szint: RETRIEVED (valódi kereső-API), CONSTRUCTED (épített
+    /// kereső/hivatalos URL), SUGGESTED (AI-javaslat), CAPTURED (rögzített).
+    #[serde(default)]
+    pub evidence_level: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -193,13 +201,12 @@ struct AiSearchResponse {
 #[derive(Deserialize, Debug)]
 struct AiSuggestion {
     title: Option<String>,
-    url: Option<String>,
     snippet: Option<String>,
     tier: Option<i32>,
-    source_type: Option<String>,
     relevance: Option<i32>,
     query_used: Option<String>,
-    action_label: Option<String>,
+    // A modell 'url'/'source_type'/'action_label' mezoit szandekosan nem hasznaljuk
+    // (a serde ignoralja): az AI-javaslat mindig keresesse alakul (FIX-AI-LINKS).
 }
 
 pub struct DbState {
@@ -232,31 +239,6 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
-
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN preliminary_opinion TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN final_opinion TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN report_status TEXT NOT NULL DEFAULT 'tervezet'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN finalizable TEXT NOT NULL DEFAULT 'nem'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN open_questions TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE cases ADD COLUMN closed_points TEXT NOT NULL DEFAULT ''",
-        [],
-    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS audit_logs (
@@ -301,60 +283,6 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let _ = conn.execute("ALTER TABLE sources ADD COLUMN search_run_id INTEGER", []);
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN original_url TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN archived_url TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN snapshot_timestamp TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN archive_kind TEXT NOT NULL DEFAULT 'live'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN source_status TEXT NOT NULL DEFAULT 'nyers'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN priority_level INTEGER NOT NULL DEFAULT 2",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN usability_decision TEXT NOT NULL DEFAULT 'hatteranyag'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN proof_summary TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN reviewer_name TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN relevance_note TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN probative_value TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE sources ADD COLUMN missing_points TEXT NOT NULL DEFAULT ''",
-        [],
-    );
-
     conn.execute(
         "CREATE TABLE IF NOT EXISTS search_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -371,11 +299,6 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
-
-    let _ = conn.execute(
-        "ALTER TABLE search_runs ADD COLUMN note TEXT NOT NULL DEFAULT ''",
-        [],
-    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS app_settings (
@@ -402,7 +325,111 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    migrate_schema(conn)?;
+
     Ok(())
+}
+
+const SCHEMA_VERSION: i64 = 1;
+
+/// true, ha a `table` tartalmazza a `column` oszlopot. A `table`/`column`
+/// kizárólag kódban rögzített literál lehet (nincs felhasználói input) → nincs SQLi.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let name: String = row.get(1).map_err(|e| e.to_string())?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Hozzáadja az oszlopot, ha hiányzik. A valódi hibák propagálnak (nincs elnyelés).
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_def: &str,
+) -> Result<(), String> {
+    if table_has_column(conn, table, column)? {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}"),
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Verziózott, determinisztikus séma-migráció. A `PRAGMA user_version` kapun áll:
+/// ha a DB már a célverzión van, nem végez séma-műveletet.
+fn migrate_schema(conn: &Connection) -> Result<(), String> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    for (col, def) in [
+        ("preliminary_opinion", "TEXT NOT NULL DEFAULT ''"),
+        ("final_opinion", "TEXT NOT NULL DEFAULT ''"),
+        ("report_status", "TEXT NOT NULL DEFAULT 'tervezet'"),
+        ("finalizable", "TEXT NOT NULL DEFAULT 'nem'"),
+        ("open_questions", "TEXT NOT NULL DEFAULT ''"),
+        ("closed_points", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        add_column_if_missing(conn, "cases", col, def)?;
+    }
+
+    add_column_if_missing(conn, "sources", "search_run_id", "INTEGER")?;
+    for (col, def) in [
+        ("original_url", "TEXT NOT NULL DEFAULT ''"),
+        ("archived_url", "TEXT NOT NULL DEFAULT ''"),
+        ("snapshot_timestamp", "TEXT NOT NULL DEFAULT ''"),
+        ("archive_kind", "TEXT NOT NULL DEFAULT 'live'"),
+        ("source_status", "TEXT NOT NULL DEFAULT 'nyers'"),
+        ("priority_level", "INTEGER NOT NULL DEFAULT 2"),
+        ("usability_decision", "TEXT NOT NULL DEFAULT 'hatteranyag'"),
+        ("proof_summary", "TEXT NOT NULL DEFAULT ''"),
+        ("reviewer_name", "TEXT NOT NULL DEFAULT ''"),
+        ("reviewed_at", "TEXT NOT NULL DEFAULT ''"),
+        ("relevance_note", "TEXT NOT NULL DEFAULT ''"),
+        ("probative_value", "TEXT NOT NULL DEFAULT ''"),
+        ("missing_points", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        add_column_if_missing(conn, "sources", col, def)?;
+    }
+
+    add_column_if_missing(conn, "search_runs", "note", "TEXT NOT NULL DEFAULT ''")?;
+
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Maszkolja a mentett API-kulcsokat egy hiba-/naplószövegben, mielőtt az a
+/// felhasználóhoz vagy az audit_logs-ba kerül (SEC-1). A rövid/üres kulcsot sose
+/// cseréli, hogy ne maszkoljon el ártatlan szövegrészt.
+fn redact_secrets(input: &str, settings: &AppSettings) -> String {
+    let mut out = input.to_string();
+    for secret in [
+        &settings.api_key,
+        &settings.google_cse_key,
+        &settings.brave_key,
+        &settings.tavily_key,
+    ] {
+        let s = secret.trim();
+        if s.len() >= 6 {
+            out = out.replace(s, "***");
+        }
+    }
+    out
 }
 
 fn default_app_settings() -> AppSettings {
@@ -423,6 +450,62 @@ fn default_app_settings() -> AppSettings {
     }
 }
 
+/// Megosztott, 30 s-os HTTP-kliens a keresési providerekhez (PERF-1).
+fn search_client() -> Result<&'static Client, String> {
+    static CELL: OnceLock<Client> = OnceLock::new();
+    if let Some(c) = CELL.get() {
+        return Ok(c);
+    }
+    let c = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let _ = CELL.set(c);
+    Ok(CELL.get().expect("just set"))
+}
+
+/// Megosztott, 45 s-os HTTP-kliens az AI-hívásokhoz (PERF-1).
+fn ai_client() -> Result<&'static Client, String> {
+    static CELL: OnceLock<Client> = OnceLock::new();
+    if let Some(c) = CELL.get() {
+        return Ok(c);
+    }
+    let c = Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let _ = CELL.set(c);
+    Ok(CELL.get().expect("just set"))
+}
+
+fn archive_dir_for(db_path: &str) -> PathBuf {
+    Path::new(db_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("archive")
+}
+
+/// true, ha a `candidate` az archive mappán belül van (kanonizált út-összevetés, SEC-3).
+fn is_within_archive(db_path: &str, candidate: &str) -> bool {
+    let base = match archive_dir_for(db_path).canonicalize() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    match Path::new(candidate).canonicalize() {
+        Ok(c) => c.starts_with(&base),
+        Err(_) => false,
+    }
+}
+
+/// A PowerShell spawn-hibáját érthető üzenetre képezi (DPAPI Windows-kötöttség, PLAT-1).
+fn map_powershell_spawn_error(kind: std::io::ErrorKind, raw: &str) -> String {
+    if kind == std::io::ErrorKind::NotFound {
+        "A titkos kulcsok titkosítása Windows PowerShellt (DPAPI) igényel, ami ezen a rendszeren nem található. A kulcs nem menthető biztonságosan.".to_string()
+    } else {
+        format!("PowerShell futtatási hiba: {raw}")
+    }
+}
+
 fn run_powershell_with_stdin(script: &str, stdin_payload: &str) -> Result<String, String> {
     let mut child = Command::new("powershell")
         .args(["-NoProfile", "-Command", script])
@@ -430,7 +513,7 @@ fn run_powershell_with_stdin(script: &str, stdin_payload: &str) -> Result<String
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("PowerShell futtatasi hiba: {e}"))?;
+        .map_err(|e| map_powershell_spawn_error(e.kind(), &e.to_string()))?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -632,7 +715,16 @@ fn push_result(
             relevance,
             query_used,
             action_label: action_label.to_string(),
+            evidence_level: String::new(),
         });
+    }
+}
+
+/// A `from` indextől a végéig beállítja az evidence-szintet a most hozzáadott
+/// találatokra (KRISTA-alapelv: a provenance elsőrangú, találat-fajtánként).
+fn tag_evidence(results: &mut [SearchResult], from: usize, level: &str) {
+    for result in results.iter_mut().skip(from) {
+        result.evidence_level = level.to_string();
     }
 }
 
@@ -877,6 +969,18 @@ fn fallback_result_url(query: &str) -> String {
     build_search_url("google", query)
 }
 
+/// Az AI-javaslatokhoz mindig valódi keresési URL-t ad a legpontosabb elérhető
+/// szövegre (query_used → title → alap lekérdezés). Így az AI által esetleg
+/// hallucinált nyers URL sosem jelenik meg találati linkként (FIX-AI-LINKS).
+fn ai_suggestion_url(query_used: Option<&str>, title: Option<&str>, base_query: &str) -> String {
+    let seed = query_used
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| title.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or(base_query);
+    fallback_result_url(seed)
+}
+
 fn request_ai_search_response(
     provider: &str,
     api_key: &str,
@@ -886,14 +990,11 @@ fn request_ai_search_response(
 ) -> Result<String, String> {
     let user_prompt = format!(
         "Keresesi feladat: {query}\n\nAdj vissza egy JSON objektumot ebben a formatumban: \
-{{\"search_brief\":\"...\",\"suggestions\":[{{\"title\":\"...\",\"url\":\"...\",\"snippet\":\"...\",\"tier\":2,\"source_type\":\"...\",\"relevance\":88,\"query_used\":\"...\",\"action_label\":\"...\"}}]}}. \
-Legyen 5-8 javaslat. Ha nincs konkret URL, adj Google kereses URL-t vagy hagyd uresen."
+{{\"search_brief\":\"...\",\"suggestions\":[{{\"title\":\"...\",\"snippet\":\"...\",\"tier\":2,\"source_type\":\"...\",\"relevance\":88,\"query_used\":\"...\",\"action_label\":\"...\"}}]}}. \
+Legyen 5-8 javaslat. NE adj meg URL-t es ne talalj ki linket; a 'query_used' mezobe adj pontos, lefuttathato keresokifejezest. A rendszer minden javaslathoz keresest nyit a kifejezesre."
     );
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializalasi hiba: {e}"))?;
+    let client = ai_client()?;
 
     let response_text = match provider {
         "openrouter" => {
@@ -921,8 +1022,9 @@ Legyen 5-8 javaslat. Ha nincs konkret URL, adj Google kereses URL-t vagy hagyd u
         "gemini" => {
             let response = client
                 .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+                    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                 ))
+                .header("x-goog-api-key", api_key)
                 .header("Content-Type", "application/json")
                 .json(&json!({
                     "systemInstruction": {
@@ -1052,11 +1154,9 @@ fn add_ai_results(
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| query.to_string());
 
-        let url = item
-            .url
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| fallback_result_url(&item_query));
+        // FIX-AI-LINKS: az AI nyers url-jét sosem használjuk (gyakran hallucinált);
+        // mindig valódi keresést nyitunk a javasolt kifejezésre.
+        let url = ai_suggestion_url(item.query_used.as_deref(), item.title.as_deref(), query);
 
         push_detected_result(
             results,
@@ -1067,10 +1167,10 @@ fn add_ai_results(
                 .clone()
                 .unwrap_or_else(|| "AI altal javasolt keresesi vagy ellenorzesi lepés.".to_string()),
             item.tier.unwrap_or(2),
-            item.source_type.as_deref().unwrap_or("AI javaslat"),
+            "AI keresési javaslat",
             item.relevance.unwrap_or(80),
             item_query,
-            item.action_label.as_deref().unwrap_or("Megnyitas"),
+            "Keresés megnyitása",
         );
     }
 
@@ -1126,10 +1226,7 @@ fn add_cse_results(
     api_key: &str,
     cx: &str,
 ) -> Result<usize, String> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let client = search_client()?;
 
     let response = client
         .get("https://www.googleapis.com/customsearch/v1")
@@ -1192,10 +1289,7 @@ fn add_brave_results(
     query: &str,
     api_key: &str,
 ) -> Result<usize, String> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let client = search_client()?;
 
     let response = client
         .get("https://api.search.brave.com/res/v1/web/search")
@@ -1265,10 +1359,7 @@ fn add_tavily_results(
     query: &str,
     api_key: &str,
 ) -> Result<usize, String> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let client = search_client()?;
 
     let (effective_query, site_domains) = split_query_for_domain_search(query);
 
@@ -1944,6 +2035,16 @@ fn delete_case(state: tauri::State<'_, DbState>, id: i64) -> Result<String, Stri
 
     let mut failed_files = 0usize;
     for path in &file_paths {
+        if !is_within_archive(&state.db_path, path) {
+            let _ = log_action(
+                &state.db_path,
+                id,
+                "case_file_delete_skipped_out_of_scope",
+                path,
+                "Törlés kihagyva: a fájl az archive mappán kívül esik.",
+            );
+            continue;
+        }
         match fs::remove_file(path) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2024,19 +2125,29 @@ fn delete_source(state: tauri::State<'_, DbState>, id: i64) -> Result<String, St
         .map_err(|e| e.to_string())?;
 
     if !file_path.is_empty() {
-        match fs::remove_file(&file_path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                log_action(
-                    &state.db_path,
-                    case_id,
-                    "source_deletion_error",
-                    &id.to_string(),
-                    &format!("Forrásfájl törlése sikertelen: {file_path}. Hiba: {error}"),
-                )?;
-                return Err(format!("A forrásfájl törlése sikertelen: {error}"));
+        if is_within_archive(&state.db_path, &file_path) {
+            match fs::remove_file(&file_path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log_action(
+                        &state.db_path,
+                        case_id,
+                        "source_deletion_error",
+                        &id.to_string(),
+                        &format!("Forrásfájl törlése sikertelen: {file_path}. Hiba: {error}"),
+                    )?;
+                    return Err(format!("A forrásfájl törlése sikertelen: {error}"));
+                }
             }
+        } else {
+            log_action(
+                &state.db_path,
+                case_id,
+                "source_file_delete_skipped_out_of_scope",
+                &id.to_string(),
+                &format!("Törlés kihagyva: a fájl az archive mappán kívül esik: {file_path}"),
+            )?;
         }
     }
 
@@ -2365,10 +2476,13 @@ fn execute_search_blocking(
     let mut tavily_error: Option<String> = None;
 
     if effective_mode != "ai_only" {
+        let constructed_start = results.len();
         add_engine_launchers(&mut results, 0, engine, trimmed);
         add_curated_sources(&mut results, 0, trimmed, selected_source_packs);
         add_domain_specific_sources(&mut results, 0, trimmed, selected_source_packs);
+        tag_evidence(&mut results, constructed_start, "CONSTRUCTED");
 
+        let retrieved_start = results.len();
         if include_cse && !settings.tavily_key.trim().is_empty() {
             match add_tavily_results(&mut results, trimmed, settings.tavily_key.trim()) {
                 Ok(count) => {
@@ -2381,6 +2495,7 @@ fn execute_search_blocking(
                     );
                 }
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     tavily_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2405,6 +2520,7 @@ fn execute_search_blocking(
                     );
                 }
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     brave_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2436,6 +2552,7 @@ fn execute_search_blocking(
                     );
                 }
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     cse_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2447,8 +2564,10 @@ fn execute_search_blocking(
                 }
             }
         }
+        tag_evidence(&mut results, retrieved_start, "RETRIEVED");
     }
 
+    let suggested_start = results.len();
     if effective_mode != "native" {
         if settings.api_key.trim().is_empty() {
             ai_error = Some(
@@ -2459,6 +2578,7 @@ fn execute_search_blocking(
             match add_ai_results(&mut results, 0, trimmed, &settings) {
                 Ok(brief) => ai_brief = brief,
                 Err(error) => {
+                    let error = redact_secrets(&error, &settings);
                     ai_error = Some(error.clone());
                     let _ = log_action(
                         db_path,
@@ -2488,6 +2608,7 @@ fn execute_search_blocking(
             );
         }
     }
+    tag_evidence(&mut results, suggested_start, "SUGGESTED");
 
     let generated_count = results.len() as i32;
     if tier_filter > 0 {
@@ -2765,6 +2886,63 @@ async fn fetch_page_text(url: String) -> Result<FetchedPage, String> {
         .map_err(|e| format!("Oldalletöltési belső hiba: {e}"))?
 }
 
+const MAX_FETCH_BYTES: u64 = 5 * 1024 * 1024;
+
+/// true, ha az IP belső/privát/loopback/link-local (SSRF-gát a fetch_page_text-hez).
+fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(&IpAddr::V4(mapped));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// A kérés előtt feloldja a hosztot, és elutasítja a belső/privát célt (SSRF-gát).
+fn ensure_host_allowed(url: &reqwest::Url) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+    let host = url.host_str().ok_or("Hiányzó hoszt az URL-ben.")?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err("Belső cím nem tölthető le.".to_string());
+    }
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("Névfeloldás sikertelen: {e}"))?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if is_blocked_ip(&addr.ip()) {
+            return Err("Belső vagy privát hálózati cím nem tölthető le.".to_string());
+        }
+    }
+    if !any {
+        return Err("A hoszt nem feloldható.".to_string());
+    }
+    Ok(())
+}
+
+/// Legfeljebb `max` bájtot olvas a válaszból (memória-korlát).
+fn read_body_capped<R: Read>(reader: R, max: u64) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    reader.take(max).read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
 fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
     let parsed: reqwest::Url = url
         .parse()
@@ -2774,9 +2952,26 @@ fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
         return Err("Csak http vagy https URL tölthető le.".to_string());
     }
 
+    ensure_host_allowed(&parsed)?;
+
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) IRBR-archiver/0.1")
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let blocked = attempt
+                .url()
+                .host_str()
+                .map(|h| {
+                    h.eq_ignore_ascii_case("localhost")
+                        || h.parse::<IpAddr>().map(|ip| is_blocked_ip(&ip)).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if blocked {
+                attempt.error("blokkolt redirect cél")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
 
@@ -2785,11 +2980,17 @@ fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
         .send()
         .map_err(|e| format!("Az oldal letöltése sikertelen: {e}"))?;
 
+    if let Some(len) = response.content_length() {
+        if len > MAX_FETCH_BYTES {
+            return Err("A letöltendő tartalom túl nagy.".to_string());
+        }
+    }
+
     let status = response.status().as_u16();
     let final_url = response.url().to_string();
-    let body = response
-        .text()
+    let bytes = read_body_capped(response, MAX_FETCH_BYTES)
         .map_err(|e| format!("Az oldal tartalmának olvasása sikertelen: {e}"))?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let (title, text) = extract_text_from_html(&body);
 
@@ -2882,6 +3083,217 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_secrets_masks_configured_keys() {
+        let mut settings = default_app_settings();
+        settings.google_cse_key = "AIzaSyTESTKEY1234567890".to_string();
+        let message = "Google CSE hivas sikertelen: key=AIzaSyTESTKEY1234567890 (HTTP 403)";
+        let redacted = redact_secrets(message, &settings);
+        assert!(!redacted.contains("AIzaSyTESTKEY1234567890"));
+        assert!(redacted.contains("***"));
+    }
+
+    #[test]
+    fn redact_secrets_ignores_empty_and_short_keys() {
+        let mut settings = default_app_settings();
+        settings.api_key = String::new();
+        settings.brave_key = "abc".to_string();
+        let message = "Hiba: abc tortent, nincs kulcs";
+        assert_eq!(redact_secrets(message, &settings), message);
+    }
+
+    #[test]
+    fn redact_secrets_masks_all_occurrences() {
+        let mut settings = default_app_settings();
+        settings.tavily_key = "tvly-SECRETVALUE99".to_string();
+        let message = "tvly-SECRETVALUE99 ... ismet tvly-SECRETVALUE99";
+        let redacted = redact_secrets(message, &settings);
+        assert!(!redacted.contains("tvly-SECRETVALUE99"));
+    }
+
+    #[test]
+    fn tag_evidence_only_tags_from_index_and_default_is_empty() {
+        let mut results = Vec::new();
+        push_result(
+            &mut results, 0, "a", "u".to_string(), String::new(), String::new(),
+            "live".to_string(), String::new(), String::new(), 3, "x", 50, "q".to_string(), "open",
+        );
+        assert_eq!(results[0].evidence_level, ""); // push_result default üres
+        let from = results.len();
+        push_result(
+            &mut results, 0, "b", "u2".to_string(), String::new(), String::new(),
+            "live".to_string(), String::new(), String::new(), 3, "x", 50, "q".to_string(), "open",
+        );
+        tag_evidence(&mut results, from, "RETRIEVED");
+        assert_eq!(results[0].evidence_level, ""); // korábbi érintetlen
+        assert_eq!(results[1].evidence_level, "RETRIEVED");
+    }
+
+    #[test]
+    fn ai_suggestion_url_is_always_a_search_never_raw() {
+        // query_used elsőbbség, és mindig Google-keresés (nem nyers AI-URL)
+        let u = ai_suggestion_url(Some("mezőgazdasági óradíj 2020"), Some("Cím"), "alap");
+        assert!(u.contains("www.google.com/search?q="));
+        assert!(u.contains("2020"));
+        // üres query_used -> title
+        let u2 = ai_suggestion_url(Some("   "), Some("KSH statisztika"), "alap");
+        assert!(u2.contains("www.google.com/search?q="));
+        // egyik sincs -> alap lekérdezés
+        let u3 = ai_suggestion_url(None, None, "alap lekérdezés");
+        assert!(u3.contains("www.google.com/search?q="));
+    }
+
+    #[test]
+    fn search_and_ai_clients_are_reused() {
+        assert!(std::ptr::eq(search_client().unwrap(), search_client().unwrap()));
+        assert!(std::ptr::eq(ai_client().unwrap(), ai_client().unwrap()));
+    }
+
+    #[test]
+    fn map_powershell_spawn_error_explains_missing_powershell() {
+        let missing = map_powershell_spawn_error(std::io::ErrorKind::NotFound, "not found");
+        assert!(missing.contains("DPAPI") && missing.contains("PowerShell"));
+        let other = map_powershell_spawn_error(std::io::ErrorKind::PermissionDenied, "boom");
+        assert!(other.contains("boom"));
+    }
+
+    #[test]
+    fn is_within_archive_allows_only_archive_files() {
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("irbr_sec3_test_{}", std::process::id()));
+        let archive = base.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let db_path = base.join("irbr_database.db");
+        fs::write(&db_path, b"x").unwrap();
+        let inside = archive.join("src_1.txt");
+        fs::write(&inside, b"a").unwrap();
+        let outside = base.join("titok.txt");
+        fs::write(&outside, b"b").unwrap();
+
+        let db = db_path.to_string_lossy().into_owned();
+        assert!(is_within_archive(&db, &inside.to_string_lossy()));
+        assert!(!is_within_archive(&db, &outside.to_string_lossy()));
+        let traversal = archive.join("..").join("titok.txt");
+        assert!(!is_within_archive(&db, &traversal.to_string_lossy()));
+        assert!(!is_within_archive(&db, &archive.join("nincs.txt").to_string_lossy()));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn add_column_if_missing_adds_then_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE cases (id INTEGER PRIMARY KEY, title TEXT)", [])
+            .unwrap();
+        assert!(!table_has_column(&conn, "cases", "report_status").unwrap());
+        add_column_if_missing(&conn, "cases", "report_status", "TEXT NOT NULL DEFAULT 'tervezet'")
+            .unwrap();
+        assert!(table_has_column(&conn, "cases", "report_status").unwrap());
+        // második hívás no-op, hibamentes
+        add_column_if_missing(&conn, "cases", "report_status", "TEXT NOT NULL DEFAULT 'tervezet'")
+            .unwrap();
+    }
+
+    #[test]
+    fn add_column_if_missing_propagates_real_errors() {
+        let conn = Connection::open_in_memory().unwrap();
+        // nem létező tábla -> valódi hiba, NEM elnyelve
+        assert!(add_column_if_missing(&conn, "nem_letezo_tabla", "x", "TEXT").is_err());
+    }
+
+    #[test]
+    fn migrate_schema_upgrades_legacy_db_and_preserves_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE cases (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT, deadline TEXT, status TEXT, created_at TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY, case_id INTEGER)", [])
+            .unwrap();
+        conn.execute("CREATE TABLE search_runs (id INTEGER PRIMARY KEY, case_id INTEGER)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO cases (title, description) VALUES ('Teszt ügy', 'leiras')",
+            [],
+        )
+        .unwrap();
+
+        migrate_schema(&conn).unwrap();
+
+        assert!(table_has_column(&conn, "cases", "report_status").unwrap());
+        assert!(table_has_column(&conn, "sources", "missing_points").unwrap());
+        assert!(table_has_column(&conn, "search_runs", "note").unwrap());
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let title: String = conn
+            .query_row("SELECT title FROM cases WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "Teszt ügy");
+    }
+
+    #[test]
+    fn migrate_schema_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE cases (id INTEGER PRIMARY KEY)", []).unwrap();
+        conn.execute("CREATE TABLE sources (id INTEGER PRIMARY KEY)", []).unwrap();
+        conn.execute("CREATE TABLE search_runs (id INTEGER PRIMARY KEY)", []).unwrap();
+        migrate_schema(&conn).unwrap();
+        migrate_schema(&conn).unwrap(); // no-op a user_version kapun
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn is_blocked_ip_blocks_internal_ranges() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.5",
+            "192.168.1.10",
+            "172.16.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                is_blocked_ip(&ip.parse::<IpAddr>().unwrap()),
+                "blokkolandó: {ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_blocked_ip_allows_public_addresses() {
+        for ip in ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+            assert!(
+                !is_blocked_ip(&ip.parse::<IpAddr>().unwrap()),
+                "engedélyezett: {ip}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_body_capped_enforces_limit() {
+        use std::io::Cursor;
+        let capped = read_body_capped(Cursor::new(vec![b'a'; 10]), 4).unwrap();
+        assert_eq!(capped.len(), 4);
+    }
+
+    #[test]
+    fn read_body_capped_returns_small_body_intact() {
+        use std::io::Cursor;
+        let data = vec![b'x'; 3];
+        let capped = read_body_capped(Cursor::new(data.clone()), 100).unwrap();
+        assert_eq!(capped, data);
+    }
 
     #[test]
     fn normalize_for_match_strips_hungarian_accents() {
@@ -2996,7 +3408,7 @@ mod tests {
     fn tier_filter_keeps_better_tiers() {
         let mut results = Vec::new();
         add_engine_launchers(&mut results, 0, "google", "teszt lekérdezés");
-        add_curated_sources(&mut results, 0, "teszt lekérdezés");
+        add_curated_sources(&mut results, 0, "teszt lekérdezés", &[]);
         let generated = results.len();
         assert!(generated > 0);
 
