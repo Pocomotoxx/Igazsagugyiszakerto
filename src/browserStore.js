@@ -21,15 +21,21 @@ function labelOf(tab) {
 async function ensureListener() {
   if (listening) return;
   listening = true;
+  await listen("browser-title", (event) => {
+    const { label, title } = event.payload;
+    const tab = browser.tabs.find((item) => labelOf(item) === label);
+    if (tab && title?.trim()) {
+      tab.title = title.trim();
+      tab.titled = true;
+    }
+  });
   await listen("browser-nav", (event) => {
     const { label, url, loading } = event.payload;
     const tab = browser.tabs.find((item) => labelOf(item) === label);
     if (!tab) return;
     tab.url = url;
     tab.loading = loading;
-    if (!tab.title || tab.title === tab.initialTitle) {
-      tab.title = shortTitle(url, tab.initialTitle);
-    }
+    if (!tab.titled) tab.title = shortTitle(url, tab.initialTitle);
   });
 }
 

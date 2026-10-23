@@ -2855,7 +2855,7 @@ function tierBadgeClass(tier) {
           </div>
         </section>
 
-        <section v-else-if="currentTab === 'browser'" class="glass rounded-[28px] p-6">
+        <section v-else-if="currentTab === 'browser'">
           <BrowserPanel
             :case-id="currentCase?.id ?? null"
             :suggestions="browserPlanSuggestions"

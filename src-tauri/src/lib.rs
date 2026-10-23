@@ -2806,6 +2806,12 @@ struct BrowserNavEvent {
     loading: bool,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct BrowserTitleEvent {
+    label: String,
+    title: String,
+}
+
 fn browser_label(tab_id: &str) -> Result<String, String> {
     if tab_id.is_empty() || !tab_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err("Érvénytelen böngészőfül-azonosító.".to_string());
@@ -2853,6 +2859,8 @@ async fn browser_open_tab(
     let nav_label = label.clone();
     let load_app = app.clone();
     let load_label = label.clone();
+    let title_app = app.clone();
+    let title_label = label.clone();
 
     let builder = tauri::webview::WebviewBuilder::new(&label, tauri::WebviewUrl::External(parsed))
         .on_navigation(move |target| {
@@ -2868,6 +2876,15 @@ async fn browser_open_tab(
                 );
             }
             allowed
+        })
+        .on_document_title_changed(move |_webview, title| {
+            let _ = title_app.emit(
+                "browser-title",
+                BrowserTitleEvent {
+                    label: title_label.clone(),
+                    title,
+                },
+            );
         })
         .on_page_load(move |_webview, payload| {
             let loading = matches!(payload.event(), tauri::webview::PageLoadEvent::Started);
