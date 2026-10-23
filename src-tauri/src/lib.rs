@@ -4,15 +4,22 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::io::Read;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Instant;
 use tauri::{Emitter, Manager};
+
+mod export;
+mod fetchx;
+mod history;
+mod provenance;
+mod story;
 
 const MAX_SEARCH_QUERY_LEN: usize = 2000;
 const ENCRYPTED_SECRET_PREFIX: &str = "dpapi:";
@@ -88,6 +95,29 @@ pub struct SearchResult {
     /// kereső/hivatalos URL), SUGGESTED (AI-javaslat), CAPTURED (rögzített).
     #[serde(default)]
     pub evidence_level: String,
+    /// A szolgáltató által megadott közzétételi idő (UTC RFC 3339), ha ismert.
+    #[serde(default)]
+    pub published_at: String,
+    /// "friss", "elavult" vagy "ismeretlen" (csak valódi találatnál).
+    #[serde(default)]
+    pub freshness: String,
+    /// Azonos történetet jelentő találatok közös azonosítója (0 = nincs).
+    #[serde(default)]
+    pub story_id: i64,
+    #[serde(default)]
+    pub story_size: i32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProviderHealth {
+    pub id: String,
+    pub label: String,
+    /// "ok", "hiba", "kikapcsolva" vagy "kihagyva"
+    pub state: String,
+    pub count: i32,
+    pub ms: i64,
+    #[serde(default)]
+    pub error: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -141,6 +171,8 @@ pub struct SearchRunOutput {
     pub tavily_error: Option<String>,
     pub generated_count: i32,
     pub filtered_out_count: i32,
+    #[serde(default)]
+    pub health: Vec<ProviderHealth>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -160,6 +192,7 @@ struct BraveItem {
     title: Option<String>,
     url: Option<String>,
     description: Option<String>,
+    page_age: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -177,6 +210,7 @@ struct TavilyItem {
     title: Option<String>,
     url: Option<String>,
     content: Option<String>,
+    published_date: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -190,6 +224,15 @@ pub struct FetchedPage {
     pub text: String,
     pub status: u16,
     pub final_url: String,
+    #[serde(default)]
+    pub published_at: String,
+    #[serde(default)]
+    pub modified_at: String,
+    #[serde(default)]
+    pub time_source: String,
+    /// Igaz, ha a letöltött tartalom a méretkorlát miatt csonka.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -301,6 +344,29 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS run_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            url_key TEXT NOT NULL,
+            url TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            tier INTEGER NOT NULL DEFAULT 3,
+            source_type TEXT NOT NULL DEFAULT '',
+            query_used TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL DEFAULT '',
+            evidence_level TEXT NOT NULL DEFAULT '',
+            story_id INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_results_run_id ON run_results(run_id)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -330,7 +396,7 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// true, ha a `table` tartalmazza a `column` oszlopot. A `table`/`column`
 /// kizárólag kódban rögzített literál lehet (nincs felhasználói input) → nincs SQLi.
@@ -407,6 +473,16 @@ fn migrate_schema(conn: &Connection) -> Result<(), String> {
     }
 
     add_column_if_missing(conn, "search_runs", "note", "TEXT NOT NULL DEFAULT ''")?;
+
+    // v2: szolgáltatói idők, forrás-állapot mátrix
+    for (col, def) in [
+        ("published_at", "TEXT NOT NULL DEFAULT ''"),
+        ("modified_at", "TEXT NOT NULL DEFAULT ''"),
+        ("time_source", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        add_column_if_missing(conn, "sources", col, def)?;
+    }
+    add_column_if_missing(conn, "search_runs", "health", "TEXT NOT NULL DEFAULT '[]'")?;
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|e| e.to_string())?;
@@ -716,15 +792,84 @@ fn push_result(
             query_used,
             action_label: action_label.to_string(),
             evidence_level: String::new(),
+            published_at: String::new(),
+            freshness: String::new(),
+            story_id: 0,
+            story_size: 0,
         });
     }
 }
 
 /// A `from` indextől a végéig beállítja az evidence-szintet a most hozzáadott
 /// találatokra (KRISTA-alapelv: a provenance elsőrangú, találat-fajtánként).
+fn provider_health(
+    id: &str,
+    label: &str,
+    configured: bool,
+    enabled: bool,
+    error: &Option<String>,
+    count: usize,
+    started: Instant,
+) -> ProviderHealth {
+    let state = if !configured {
+        "kikapcsolva"
+    } else if !enabled {
+        "kihagyva"
+    } else if error.is_some() {
+        "hiba"
+    } else {
+        "ok"
+    };
+    ProviderHealth {
+        id: id.into(),
+        label: label.into(),
+        state: state.into(),
+        count: count as i32,
+        ms: started.elapsed().as_millis() as i64,
+        error: error.clone().unwrap_or_default(),
+    }
+}
+
+/// A legutóbb felvett találat közzétételi idejét állítja be, ha a szolgáltató adott érvényeset.
+fn set_last_published(results: &mut [SearchResult], raw: Option<&str>) {
+    if let (Some(last), Some(raw)) = (results.last_mut(), raw) {
+        if let Some(time) = provenance::normalize_time(raw, chrono::Utc::now()) {
+            last.published_at = time;
+        }
+    }
+}
+
+/// Valódi (RETRIEVED) találatoknál frissességi címke és történet-azonosító.
+fn finalize_results(results: &mut [SearchResult]) {
+    let now = chrono::Utc::now();
+    let mut retrieved: Vec<usize> = Vec::new();
+    for (index, result) in results.iter_mut().enumerate() {
+        if result.evidence_level == "RETRIEVED" {
+            result.freshness =
+                provenance::freshness_label(result.tier, &result.published_at, now).to_string();
+            retrieved.push(index);
+        }
+    }
+    let texts: Vec<String> = retrieved
+        .iter()
+        .map(|&i| format!("{} {}", results[i].title, results[i].snippet))
+        .collect();
+    let ids = story::cluster(&texts);
+    let mut sizes: HashMap<usize, i32> = HashMap::new();
+    for id in &ids {
+        *sizes.entry(*id).or_insert(0) += 1;
+    }
+    for (position, &index) in retrieved.iter().enumerate() {
+        results[index].story_id = ids[position] as i64 + 1;
+        results[index].story_size = sizes[&ids[position]];
+    }
+}
+
 fn tag_evidence(results: &mut [SearchResult], from: usize, level: &str) {
     for result in results.iter_mut().skip(from) {
-        result.evidence_level = level.to_string();
+        if result.evidence_level.is_empty() {
+            result.evidence_level = level.to_string();
+        }
     }
 }
 
@@ -1108,6 +1253,66 @@ fn extract_json_object(raw: &str) -> String {
     }
 }
 
+const AI_MAX_TITLE: usize = 200;
+const AI_MAX_SNIPPET: usize = 600;
+const AI_MAX_QUERY: usize = 500;
+
+#[derive(Debug, PartialEq)]
+struct ValidSuggestion {
+    title: String,
+    snippet: String,
+    tier: i32,
+    relevance: i32,
+    query: Option<String>,
+}
+
+fn clip(value: &str, max: usize) -> String {
+    value.trim().chars().take(max).collect()
+}
+
+/// Séma-ellenőrzés egy AI-javaslatra: kötelező a cím vagy a lekérdezés, a hosszak
+/// korlátosak, a tier 1-4, a relevancia 0-100. Érvénytelen javaslat kiesik.
+fn validate_ai_suggestion(item: &AiSuggestion) -> Option<ValidSuggestion> {
+    let title = clip(item.title.as_deref().unwrap_or(""), AI_MAX_TITLE);
+    let query = clip(item.query_used.as_deref().unwrap_or(""), AI_MAX_QUERY);
+    if title.is_empty() && query.is_empty() {
+        return None;
+    }
+    let snippet = clip(item.snippet.as_deref().unwrap_or(""), AI_MAX_SNIPPET);
+    Some(ValidSuggestion {
+        title: if title.is_empty() { query.clone() } else { title },
+        snippet: if snippet.is_empty() {
+            "AI által javasolt keresési vagy ellenőrzési lépés.".to_string()
+        } else {
+            snippet
+        },
+        tier: item.tier.filter(|t| (1..=4).contains(t)).unwrap_or(3),
+        relevance: item.relevance.unwrap_or(80).clamp(0, 100),
+        query: if query.is_empty() { None } else { Some(query) },
+    })
+}
+
+/// Szabályalapú tartalék, ha az AI nem használható: a lekérdezés determinisztikus
+/// változatai (CONSTRUCTED), modell nélkül.
+fn add_rule_based_suggestions(results: &mut Vec<SearchResult>, query: &str) {
+    let start = results.len();
+    for (label, variant) in build_query_variants(query) {
+        push_detected_result(
+            results,
+            0,
+            &format!("Szabályalapú keresési változat: {label}"),
+            fallback_result_url(&variant),
+            format!("Determinisztikus lekérdezés-változat ({label}), AI nélkül előállítva."),
+            3,
+            "Szabályalapú javaslat",
+            70,
+            variant,
+            "Keresés megnyitása",
+        );
+    }
+    tag_evidence(results, start, "CONSTRUCTED");
+}
+
 fn add_ai_results(
     results: &mut Vec<SearchResult>,
     tier_filter: i32,
@@ -1123,52 +1328,63 @@ fn add_ai_results(
     )?;
 
     let json_payload = extract_json_object(&ai_raw);
-    let parsed = serde_json::from_str::<AiSearchResponse>(&json_payload).unwrap_or(AiSearchResponse {
-        search_brief: Some(ai_raw.clone()),
-        suggestions: None,
-    });
+    let looks_json = json_payload.trim_start().starts_with('{');
+    let parsed = match serde_json::from_str::<AiSearchResponse>(&json_payload) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            add_rule_based_suggestions(results, query);
+            if looks_json {
+                return Err(
+                    "Az AI válasza nem felelt meg a várt JSON-sémának, ezért szabályalapú javaslatok készültek helyette."
+                        .to_string(),
+                );
+            }
+            // A modell folyó szöveggel válaszolt: megtartjuk összefoglalóként.
+            push_detected_result(
+                results,
+                tier_filter,
+                "AI kutatasi osszefoglalo",
+                fallback_result_url(query),
+                clip(&ai_raw, AI_MAX_SNIPPET * 4),
+                2,
+                "AI javaslat",
+                84,
+                query.to_string(),
+                "Kereses megnyitasa",
+            );
+            return Ok(None);
+        }
+    };
 
     let brief = parsed.search_brief.clone();
-    let suggestions = parsed.suggestions.unwrap_or_default();
+    let suggestions: Vec<ValidSuggestion> = parsed
+        .suggestions
+        .unwrap_or_default()
+        .iter()
+        .filter_map(validate_ai_suggestion)
+        .collect();
 
     if suggestions.is_empty() {
-        push_detected_result(
-            results,
-            tier_filter,
-            "AI kutatasi osszefoglalo",
-            fallback_result_url(query),
-            ai_raw,
-            2,
-            "AI javaslat",
-            84,
-            query.to_string(),
-            "Kereses megnyitasa",
-        );
+        add_rule_based_suggestions(results, query);
         return Ok(brief);
     }
 
     for item in suggestions {
-        let item_query = item
-            .query_used
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| query.to_string());
+        let item_query = item.query.clone().unwrap_or_else(|| query.to_string());
 
         // FIX-AI-LINKS: az AI nyers url-jét sosem használjuk (gyakran hallucinált);
         // mindig valódi keresést nyitunk a javasolt kifejezésre.
-        let url = ai_suggestion_url(item.query_used.as_deref(), item.title.as_deref(), query);
+        let url = ai_suggestion_url(item.query.as_deref(), Some(item.title.as_str()), query);
 
         push_detected_result(
             results,
             tier_filter,
-            item.title.as_deref().unwrap_or("AI keresesi javaslat"),
+            &item.title,
             url,
-            item.snippet
-                .clone()
-                .unwrap_or_else(|| "AI altal javasolt keresesi vagy ellenorzesi lepés.".to_string()),
-            item.tier.unwrap_or(2),
+            item.snippet,
+            item.tier,
             "AI keresési javaslat",
-            item.relevance.unwrap_or(80),
+            item.relevance,
             item_query,
             "Keresés megnyitása",
         );
@@ -1228,7 +1444,7 @@ fn add_cse_results(
 ) -> Result<usize, String> {
     let client = search_client()?;
 
-    let response = client
+    let response = fetchx::send_with_retry(|| client
         .get("https://www.googleapis.com/customsearch/v1")
         .query(&[
             ("key", api_key),
@@ -1236,8 +1452,7 @@ fn add_cse_results(
             ("q", query),
             ("num", "10"),
             ("hl", "hu"),
-        ])
-        .send()
+        ]), 2)
         .map_err(|e| format!("Google CSE hívás sikertelen: {e}"))?;
 
     if !response.status().is_success() {
@@ -1291,7 +1506,7 @@ fn add_brave_results(
 ) -> Result<usize, String> {
     let client = search_client()?;
 
-    let response = client
+    let response = fetchx::send_with_retry(|| client
         .get("https://api.search.brave.com/res/v1/web/search")
         .header("Accept", "application/json")
         .header("X-Subscription-Token", api_key)
@@ -1300,8 +1515,7 @@ fn add_brave_results(
             ("count", "10"),
             ("country", "hu"),
             ("search_lang", "hu"),
-        ])
-        .send()
+        ]), 2)
         .map_err(|e| format!("Brave Search hívás sikertelen: {e}"))?;
 
     if !response.status().is_success() {
@@ -1349,6 +1563,7 @@ fn add_brave_results(
             query.to_string(),
             "Megnyitás",
         );
+        set_last_published(results, item.page_age.as_deref());
     }
 
     Ok(count)
@@ -1372,12 +1587,11 @@ fn add_tavily_results(
         body["include_domains"] = json!(site_domains);
     }
 
-    let response = client
+    let response = fetchx::send_with_retry(|| client
         .post("https://api.tavily.com/search")
         .bearer_auth(api_key)
         .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
+        .json(&body), 2)
         .map_err(|e| format!("Tavily hívás sikertelen: {e}"))?;
 
     if !response.status().is_success() {
@@ -1432,6 +1646,7 @@ fn add_tavily_results(
             query.to_string(),
             "Megnyitás",
         );
+        set_last_published(results, item.published_date.as_deref());
     }
 
     Ok(count)
@@ -2247,13 +2462,20 @@ fn record_search_run(
     tier_filter: i32,
     plan_count: i32,
     result_count: i32,
+    results: Option<Vec<history::RunResultInput>>,
+    health: Option<serde_json::Value>,
 ) -> Result<i64, String> {
     let conn = get_connection(&state.db_path)?;
     let created_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let health_json = health
+        .filter(|value| value.is_array())
+        .map(|value| value.to_string())
+        .filter(|text| text.len() <= 20_000)
+        .unwrap_or_else(|| "[]".to_string());
 
     conn.execute(
-        "INSERT INTO search_runs (case_id, created_at, summary, base_query, engine, tier_filter, plan_count, result_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO search_runs (case_id, created_at, summary, base_query, engine, tier_filter, plan_count, result_count, health)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             case_id,
             created_at,
@@ -2262,12 +2484,16 @@ fn record_search_run(
             engine,
             tier_filter,
             plan_count,
-            result_count
+            result_count,
+            health_json
         ],
     )
     .map_err(|e| e.to_string())?;
 
     let new_id = conn.last_insert_rowid();
+    if let Some(results) = results {
+        history::save_run_results(&conn, new_id, &results)?;
+    }
     log_action(
         &state.db_path,
         case_id,
@@ -2442,6 +2668,7 @@ fn execute_search_blocking(
             tavily_error: None,
             generated_count: 0,
             filtered_out_count: 0,
+            health: Vec::new(),
         });
     }
     if trimmed.chars().count() > MAX_SEARCH_QUERY_LEN {
@@ -2474,6 +2701,7 @@ fn execute_search_blocking(
     let mut cse_error: Option<String> = None;
     let mut brave_error: Option<String> = None;
     let mut tavily_error: Option<String> = None;
+    let mut health: Vec<ProviderHealth> = Vec::new();
 
     if effective_mode != "ai_only" {
         let constructed_start = results.len();
@@ -2481,8 +2709,18 @@ fn execute_search_blocking(
         add_curated_sources(&mut results, 0, trimmed, selected_source_packs);
         add_domain_specific_sources(&mut results, 0, trimmed, selected_source_packs);
         tag_evidence(&mut results, constructed_start, "CONSTRUCTED");
+        health.push(ProviderHealth {
+            id: "native".into(),
+            label: "Keresési terv (natív)".into(),
+            state: "ok".into(),
+            count: results.len() as i32,
+            ms: 0,
+            error: String::new(),
+        });
 
         let retrieved_start = results.len();
+        let t_tavily = Instant::now();
+        let n_tavily = results.len();
         if include_cse && !settings.tavily_key.trim().is_empty() {
             match add_tavily_results(&mut results, trimmed, settings.tavily_key.trim()) {
                 Ok(count) => {
@@ -2508,6 +2746,13 @@ fn execute_search_blocking(
             }
         }
 
+        health.push(provider_health(
+            "tavily", "Tavily", !settings.tavily_key.trim().is_empty(), include_cse,
+            &tavily_error, results.len() - n_tavily, t_tavily,
+        ));
+
+        let t_brave = Instant::now();
+        let n_brave = results.len();
         if include_cse && !settings.brave_key.trim().is_empty() {
             match add_brave_results(&mut results, trimmed, settings.brave_key.trim()) {
                 Ok(count) => {
@@ -2533,6 +2778,13 @@ fn execute_search_blocking(
             }
         }
 
+        health.push(provider_health(
+            "brave", "Brave Search", !settings.brave_key.trim().is_empty(), include_cse,
+            &brave_error, results.len() - n_brave, t_brave,
+        ));
+
+        let t_cse = Instant::now();
+        let n_cse = results.len();
         let cse_configured = !settings.google_cse_key.trim().is_empty()
             && !settings.google_cse_cx.trim().is_empty();
         if include_cse && cse_configured {
@@ -2564,10 +2816,15 @@ fn execute_search_blocking(
                 }
             }
         }
+        health.push(provider_health(
+            "cse", "Google CSE", cse_configured, include_cse,
+            &cse_error, results.len() - n_cse, t_cse,
+        ));
         tag_evidence(&mut results, retrieved_start, "RETRIEVED");
     }
 
     let suggested_start = results.len();
+    let t_ai = Instant::now();
     if effective_mode != "native" {
         if settings.api_key.trim().is_empty() {
             ai_error = Some(
@@ -2591,6 +2848,24 @@ fn execute_search_blocking(
             }
         }
     }
+
+    health.push(ProviderHealth {
+        id: "ai".into(),
+        label: "AI".into(),
+        state: if effective_mode == "native" {
+            "kihagyva"
+        } else if settings.api_key.trim().is_empty() {
+            "kikapcsolva"
+        } else if ai_error.is_some() {
+            "hiba"
+        } else {
+            "ok"
+        }
+        .into(),
+        count: (results.len() - suggested_start) as i32,
+        ms: t_ai.elapsed().as_millis() as i64,
+        error: ai_error.clone().unwrap_or_default(),
+    });
 
     if let Some(brief) = ai_brief {
         if !brief.trim().is_empty() {
@@ -2629,6 +2904,28 @@ fn execute_search_blocking(
     }
 
     results.sort_by(|a, b| b.relevance.cmp(&a.relevance));
+    finalize_results(&mut results);
+
+    // Minden szolgáltató szerepeljen a mátrixban, a kihagyottak is.
+    for (id, label) in [
+        ("native", "Keresési terv (natív)"),
+        ("tavily", "Tavily"),
+        ("brave", "Brave Search"),
+        ("cse", "Google CSE"),
+        ("ai", "AI"),
+    ] {
+        if !health.iter().any(|h| h.id == id) {
+            health.push(ProviderHealth {
+                id: id.into(),
+                label: label.into(),
+                state: "kihagyva".into(),
+                count: 0,
+                ms: 0,
+                error: String::new(),
+            });
+        }
+    }
+
     Ok(SearchRunOutput {
         results,
         ai_error,
@@ -2637,6 +2934,7 @@ fn execute_search_blocking(
         tavily_error,
         generated_count,
         filtered_out_count,
+        health,
     })
 }
 
@@ -2649,7 +2947,24 @@ fn archive_source(
     url: String,
     tier: i32,
     content: String,
+    published_at: Option<String>,
+    modified_at: Option<String>,
+    time_source: Option<String>,
 ) -> Result<Source, String> {
+    let now_utc = chrono::Utc::now();
+    let published_at = published_at
+        .and_then(|v| provenance::normalize_time(&v, now_utc))
+        .unwrap_or_default();
+    let modified_at = modified_at
+        .and_then(|v| provenance::normalize_time(&v, now_utc))
+        .unwrap_or_default();
+    let time_source = if published_at.is_empty() && modified_at.is_empty() {
+        String::new()
+    } else {
+        time_source
+            .map(|v| v.chars().take(20).collect::<String>())
+            .unwrap_or_default()
+    };
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let (original_url, archived_url, snapshot_timestamp) = detect_archive_metadata(&url);
     let normalized_judgement_url = if !original_url.is_empty() {
@@ -2686,8 +3001,8 @@ fn archive_source(
 
     let conn = get_connection(&state.db_path)?;
     conn.execute(
-        "INSERT INTO sources (case_id, search_run_id, title, url, original_url, archived_url, snapshot_timestamp, archive_kind, tier, content, file_path, hash, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO sources (case_id, search_run_id, title, url, original_url, archived_url, snapshot_timestamp, archive_kind, tier, content, file_path, hash, timestamp, published_at, modified_at, time_source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             case_id,
             search_run_id,
@@ -2701,7 +3016,10 @@ fn archive_source(
             content,
             file_path_str,
             hash_hex,
-            timestamp
+            timestamp,
+            published_at,
+            modified_at,
+            time_source
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -3156,12 +3474,6 @@ fn ensure_host_allowed(url: &reqwest::Url) -> Result<(), String> {
 }
 
 /// Legfeljebb `max` bájtot olvas a válaszból (memória-korlát).
-fn read_body_capped<R: Read>(reader: R, max: u64) -> std::io::Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    reader.take(max).read_to_end(&mut buffer)?;
-    Ok(buffer)
-}
-
 fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
     let parsed: reqwest::Url = url
         .parse()
@@ -3194,9 +3506,7 @@ fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
         .build()
         .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
 
-    let response = client
-        .get(parsed)
-        .send()
+    let response = fetchx::send_with_retry(|| client.get(parsed.clone()), 2)
         .map_err(|e| format!("Az oldal letöltése sikertelen: {e}"))?;
 
     if let Some(len) = response.content_length() {
@@ -3207,18 +3517,148 @@ fn fetch_page_text_blocking(url: &str) -> Result<FetchedPage, String> {
 
     let status = response.status().as_u16();
     let final_url = response.url().to_string();
-    let bytes = read_body_capped(response, MAX_FETCH_BYTES)
+    let last_modified = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let (bytes, truncated) = fetchx::read_capped_strict(response, MAX_FETCH_BYTES)
         .map_err(|e| format!("Az oldal tartalmának olvasása sikertelen: {e}"))?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
 
     let (title, text) = extract_text_from_html(&body);
+    let times = provenance::extract_page_times(&body, &last_modified, chrono::Utc::now());
 
     Ok(FetchedPage {
         title,
         text,
         status,
         final_url,
+        published_at: times.published_at,
+        modified_at: times.modified_at,
+        time_source: times.time_source,
+        truncated,
     })
+}
+
+#[tauri::command]
+fn search_history(
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    filters: Option<history::HistoryFilters>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<history::HistoryPage, String> {
+    let conn = get_connection(&state.db_path)?;
+    history::search(
+        &conn,
+        case_id,
+        &filters.unwrap_or_default(),
+        page.unwrap_or(0),
+        page_size.unwrap_or(25),
+    )
+}
+
+#[tauri::command]
+fn inspect_source(
+    state: tauri::State<'_, DbState>,
+    source_id: i64,
+) -> Result<history::Inspection, String> {
+    let conn = get_connection(&state.db_path)?;
+    let inspection = history::inspect(&conn, source_id, &archive_dir_for(&state.db_path))?;
+    log_action(
+        &state.db_path,
+        inspection.record.case_id,
+        "source_inspected",
+        &inspection.record.url,
+        &format!("Rekordvizsgálat. Integritás: {}.", inspection.integrity.state),
+    )?;
+    Ok(inspection)
+}
+
+#[tauri::command]
+fn export_sources(
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    format: String,
+    filters: Option<history::HistoryFilters>,
+) -> Result<String, String> {
+    let conn = get_connection(&state.db_path)?;
+    let filters = filters.unwrap_or_default();
+    let total = history::count_records(&conn, case_id, &filters)?;
+    let records = history::query_records(&conn, case_id, &filters, export::EXPORT_CAP as i64, 0)?;
+    let case_title: String = conn
+        .query_row("SELECT title FROM cases WHERE id = ?1", params![case_id], |row| row.get(0))
+        .map_err(|e| format!("Az ügy nem található: {e}"))?;
+    let metadata = export::ExportMetadata {
+        generated_at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        case_title,
+        total: total as usize,
+        exported: records.len(),
+        truncated: (total as usize) > records.len(),
+        filters: filters.describe(),
+    };
+    let (content, extension) = export::render(format.trim(), &records, &metadata)?;
+
+    let dir = Path::new(&state.db_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("exports");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file_path = dir.join(format!(
+        "irbr_export_{case_id}_{}.{extension}",
+        Local::now().format("%Y%m%d_%H%M%S_%3f")
+    ));
+    fs::write(&file_path, content).map_err(|e| e.to_string())?;
+    let path_str = file_path.to_string_lossy().into_owned();
+
+    log_action(
+        &state.db_path,
+        case_id,
+        "sources_exported",
+        &path_str,
+        &format!(
+            "Forrásexport ({}): {} rekord. Szűrők: {}.",
+            format.trim(),
+            records.len(),
+            metadata.filters
+        ),
+    )?;
+    Ok(path_str)
+}
+
+#[tauri::command]
+fn compare_search_runs(
+    state: tauri::State<'_, DbState>,
+    run_a: i64,
+    run_b: i64,
+) -> Result<history::RunDelta, String> {
+    let conn = get_connection(&state.db_path)?;
+    history::compare_runs(&conn, run_a, run_b)
+}
+
+#[tauri::command]
+fn previous_run_delta(
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    run_id: i64,
+) -> Result<Option<history::RunDelta>, String> {
+    let conn = get_connection(&state.db_path)?;
+    match history::previous_run_id(&conn, case_id, run_id)? {
+        Some(previous) => Ok(Some(history::compare_runs(&conn, previous, run_id)?)),
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn get_source_health(
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    limit: Option<i64>,
+) -> Result<Vec<history::HealthRow>, String> {
+    let conn = get_connection(&state.db_path)?;
+    history::health_matrix(&conn, case_id, limit.unwrap_or(20))
 }
 
 #[tauri::command]
@@ -3300,6 +3740,12 @@ pub fn run() {
             browser_action,
             browser_close_tab,
             fetch_page_text,
+            search_history,
+            inspect_source,
+            export_sources,
+            compare_search_runs,
+            previous_run_delta,
+            get_source_health,
             save_report
         ])
         .run(tauri::generate_context!())
@@ -3429,6 +3875,85 @@ mod tests {
     }
 
     #[test]
+    fn ai_suggestion_validation_clamps_and_drops() {
+        let empty = AiSuggestion { title: None, snippet: None, tier: None, relevance: None, query_used: Some("  ".into()) };
+        assert!(validate_ai_suggestion(&empty).is_none());
+
+        let wild = AiSuggestion {
+            title: Some("x".repeat(500)),
+            snippet: Some("y".repeat(5000)),
+            tier: Some(99),
+            relevance: Some(1000),
+            query_used: Some("kifejezés".into()),
+        };
+        let valid = validate_ai_suggestion(&wild).unwrap();
+        assert_eq!(valid.title.chars().count(), AI_MAX_TITLE);
+        assert_eq!(valid.snippet.chars().count(), AI_MAX_SNIPPET);
+        assert_eq!(valid.tier, 3);
+        assert_eq!(valid.relevance, 100);
+
+        let only_query = AiSuggestion { title: None, snippet: None, tier: Some(1), relevance: None, query_used: Some("óradíj".into()) };
+        let valid = validate_ai_suggestion(&only_query).unwrap();
+        assert_eq!(valid.title, "óradíj");
+        assert_eq!(valid.tier, 1);
+        assert_eq!(valid.relevance, 80);
+    }
+
+    #[test]
+    fn rule_based_fallback_is_constructed_and_not_overwritten() {
+        let mut results = Vec::new();
+        add_rule_based_suggestions(&mut results, "szakértői óradíj");
+        assert!(results.len() >= 2);
+        assert!(results.iter().all(|r| r.evidence_level == "CONSTRUCTED"));
+        tag_evidence(&mut results, 0, "SUGGESTED");
+        assert!(results.iter().all(|r| r.evidence_level == "CONSTRUCTED"));
+    }
+
+    #[test]
+    fn finalize_marks_freshness_and_stories_only_for_retrieved() {
+        let mut results = Vec::new();
+        for (title, snippet) in [
+            ("Szakértői óradíj emelkedés új rendelet", "igazságügyi szakértők óradíja nő"),
+            ("Új rendelet: igazságügyi szakértői óradíj emelkedik", "szakértők óradíj rendelet"),
+            ("Hidegfront érkezik hétvégén", "időjárás eső országszerte"),
+        ] {
+            push_result(
+                &mut results, 0, title, format!("https://x.hu/{title}"), String::new(), String::new(),
+                "live".into(), String::new(), snippet.into(), 3, "Web", 80, "q".into(), "open",
+            );
+        }
+        push_result(
+            &mut results, 0, "Kereső", "https://google.com/search?q=x".into(), String::new(), String::new(),
+            "live".into(), String::new(), "indító".into(), 3, "Keresőmotor", 80, "q".into(), "open",
+        );
+        tag_evidence(&mut results, 0, "RETRIEVED");
+        results[3].evidence_level = "CONSTRUCTED".into();
+        results[0].published_at = "2020-01-01T00:00:00Z".into();
+        finalize_results(&mut results);
+        assert_eq!(results[0].freshness, "elavult");
+        assert_eq!(results[1].freshness, "ismeretlen");
+        assert_eq!(results[3].freshness, "");
+        assert_eq!(results[0].story_id, results[1].story_id);
+        assert_eq!(results[0].story_size, 2);
+        assert_ne!(results[0].story_id, results[2].story_id);
+        assert_eq!(results[3].story_id, 0);
+    }
+
+    #[test]
+    fn migrate_adds_v2_columns_to_a_v1_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // v1 állapot szimulálása
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        migrate_schema(&conn).unwrap();
+        assert!(table_has_column(&conn, "sources", "published_at").unwrap());
+        assert!(table_has_column(&conn, "sources", "time_source").unwrap());
+        assert!(table_has_column(&conn, "search_runs", "health").unwrap());
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM run_results", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
     fn migrate_schema_upgrades_legacy_db_and_preserves_data() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute(
@@ -3504,21 +4029,6 @@ mod tests {
                 "engedélyezett: {ip}"
             );
         }
-    }
-
-    #[test]
-    fn read_body_capped_enforces_limit() {
-        use std::io::Cursor;
-        let capped = read_body_capped(Cursor::new(vec![b'a'; 10]), 4).unwrap();
-        assert_eq!(capped.len(), 4);
-    }
-
-    #[test]
-    fn read_body_capped_returns_small_body_intact() {
-        use std::io::Cursor;
-        let data = vec![b'x'; 3];
-        let capped = read_body_capped(Cursor::new(data.clone()), 100).unwrap();
-        assert_eq!(capped, data);
     }
 
     #[test]
