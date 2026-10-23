@@ -1,6 +1,8 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  retryTab,
   activateTab,
   browser,
   closeTab,
@@ -45,12 +47,17 @@ watch(
   { immediate: true },
 );
 
+let lastRect = "";
 function measure() {
   const el = viewport.value;
   if (!el) return;
   const rect = el.getBoundingClientRect();
+  const key = [rect.left, rect.top, rect.width, rect.height].map((v) => Math.round(v)).join(",");
+  if (key === lastRect) return;
+  lastRect = key;
   setBounds({ x: rect.left, y: rect.top, width: rect.width, height: rect.height });
 }
+let poll = null;
 
 onMounted(async () => {
   await nextTick();
@@ -61,6 +68,8 @@ onMounted(async () => {
   window.addEventListener("resize", measure);
   window.addEventListener("scroll", measure, true);
   window.addEventListener("keydown", onKey);
+  // a bannerek, a fülsor és az értesítések eltolhatják a nézetet; a natív webview követi
+  poll = setInterval(measure, 250);
 });
 
 onBeforeUnmount(() => {
@@ -68,6 +77,7 @@ onBeforeUnmount(() => {
   window.removeEventListener("resize", measure);
   window.removeEventListener("scroll", measure, true);
   window.removeEventListener("keydown", onKey);
+  clearInterval(poll);
   hideAll();
 });
 
@@ -250,6 +260,16 @@ async function run(action) {
       <div v-if="activeTab?.loading" class="absolute inset-x-0 bottom-0 h-0.5 overflow-hidden bg-sky-100">
         <div class="h-full w-1/3 animate-[irbr-load_1.1s_ease-in-out_infinite] bg-sky-500"></div>
       </div>
+    </div>
+
+    <div
+      v-if="activeTab && (activeTab.error || activeTab.slow)"
+      class="flex flex-wrap items-center gap-3 border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900"
+    >
+      <span v-if="activeTab.error">A fül nem tölthető be: {{ activeTab.error }}</span>
+      <span v-else>Az oldal betöltése lassú vagy elakadt. Ha üres marad, próbáld újra, vagy nyisd meg külső böngészőben.</span>
+      <button class="rounded-full border border-amber-300 bg-white px-3 py-1 font-semibold" @click="retryTab(activeTab.id)">Újra</button>
+      <button class="rounded-full border border-amber-300 bg-white px-3 py-1 font-semibold" @click="openUrl(activeTab.url)">Külső böngészőben</button>
     </div>
 
     <!-- Tartalom -->

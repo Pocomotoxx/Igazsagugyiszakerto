@@ -50,6 +50,7 @@ async function ensureListener() {
     if (!tab) return;
     tab.url = url;
     tab.loading = loading;
+    if (!loading) tab.slow = false;
     if (!tab.titled) tab.title = shortTitle(url, tab.initialTitle);
   });
 }
@@ -71,16 +72,42 @@ export function setBounds(bounds) {
 
 // A fül webview-ja csak az első megjelenítéskor jön létre (lusta betöltés): egy keresés
 // tucatnyi fület nyithat anélkül, hogy tucatnyi oldal töltődne egyszerre.
+const SLOW_LOAD_MS = 25000;
+
 async function ensureCreated(tab) {
-  if (tab.created) return;
+  if (tab.created) return true;
   tab.created = true;
   tab.loading = true;
-  await invoke("browser_open_tab", {
-    caseId: browser.caseId,
-    tabId: tab.id,
-    url: tab.url,
-    ...browser.bounds,
-  });
+  tab.error = "";
+  tab.slow = false;
+  try {
+    await invoke("browser_open_tab", {
+      caseId: browser.caseId,
+      tabId: tab.id,
+      url: tab.url,
+      ...browser.bounds,
+    });
+  } catch (error) {
+    // a sikertelen létrehozás látható hiba, nem végtelen töltésjelző; újrapróbálható
+    tab.created = false;
+    tab.loading = false;
+    tab.error = String(error);
+    return false;
+  }
+  setTimeout(() => {
+    if (tab.loading) {
+      tab.loading = false;
+      tab.slow = true;
+    }
+  }, SLOW_LOAD_MS);
+  return true;
+}
+
+export async function retryTab(tabId) {
+  const tab = browser.tabs.find((item) => item.id === tabId);
+  if (!tab) return;
+  tab.error = "";
+  await activateTab(tabId);
 }
 
 export async function openTab({ caseId, url, title, kind = "page", lazy = false, activate = true }) {
@@ -95,6 +122,8 @@ export async function openTab({ caseId, url, title, kind = "page", lazy = false,
     loading: !lazy,
     kind,
     created: false,
+    error: "",
+    slow: false,
     titled: Boolean(title) && kind === "search",
   };
   browser.tabs.push(tab);
@@ -110,7 +139,13 @@ export async function activateTab(tabId) {
     await invoke("browser_set_visible", { tabId: previous, visible: false }).catch(() => {});
   }
   browser.activeId = tabId;
-  await ensureCreated(tab);
+  // egyszerre csak az aktív fül látszik (az újonnan létrehozott webview alapból látható)
+  for (const other of browser.tabs) {
+    if (other.created && other.id !== tabId && other.id !== previous) {
+      await invoke("browser_set_visible", { tabId: other.id, visible: false }).catch(() => {});
+    }
+  }
+  if (!(await ensureCreated(tab))) return;
   await invoke("browser_set_bounds", { tabId, ...browser.bounds }).catch(() => {});
   await invoke("browser_set_visible", { tabId, visible: browser.mounted }).catch(() => {});
 }
@@ -118,7 +153,9 @@ export async function activateTab(tabId) {
 /** Bezárja a korábbi keresés füleit (a kézzel nyitott oldalak megmaradnak). */
 export async function closeSearchTabs() {
   const ids = browser.tabs.filter((tab) => tab.kind === "search").map((tab) => tab.id);
-  for (const id of ids) await closeTab(id);
+  // a bezárás közben nem aktiválunk másik fület (különben a lusta fülek sorra létrejönnének)
+  for (const id of ids) await closeTab(id, { activateNext: false });
+  if (!browser.tabs.some((tab) => tab.id === browser.activeId)) browser.activeId = null;
 }
 
 /** Az aktív oldal megjelenített szövege és időadatai (archiváláshoz), a webview-ból kiolvasva. */
@@ -142,15 +179,15 @@ export function captureTab(tabId) {
   });
 }
 
-export async function closeTab(tabId) {
+export async function closeTab(tabId, { activateNext = true } = {}) {
   const index = browser.tabs.findIndex((tab) => tab.id === tabId);
   if (index === -1) return;
   if (browser.tabs[index].created) await invoke("browser_close_tab", { tabId }).catch(() => {});
   browser.tabs.splice(index, 1);
   if (browser.activeId === tabId) {
-    const next = browser.tabs[Math.min(index, browser.tabs.length - 1)];
     browser.activeId = null;
-    if (next) await activateTab(next.id);
+    const next = browser.tabs[Math.min(index, browser.tabs.length - 1)];
+    if (next && activateNext) await activateTab(next.id);
   }
 }
 
@@ -166,7 +203,7 @@ export async function showActive() {
   browser.mounted = true;
   const tab = browser.tabs.find((item) => item.id === browser.activeId);
   if (!tab) return;
-  await ensureCreated(tab);
+  if (!(await ensureCreated(tab))) return;
   await invoke("browser_set_bounds", { tabId: tab.id, ...browser.bounds }).catch(() => {});
   await invoke("browser_set_visible", { tabId: tab.id, visible: true }).catch(() => {});
 }
