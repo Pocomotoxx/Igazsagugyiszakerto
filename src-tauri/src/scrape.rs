@@ -270,7 +270,7 @@ pub fn run_batch(
         map.remove(&session);
     }
     // a főablak maradjon az előtérben
-    if let Some(main) = app.get_webview_window("main") {
+    if let Some(main) = app.get_window("main") {
         let _ = main.set_focus();
     }
     results

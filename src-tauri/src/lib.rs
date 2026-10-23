@@ -3656,11 +3656,11 @@ async fn browser_open_tab(
         return Err("Ez a böngészőfül már létezik.".to_string());
     }
 
+    // `get_webview_window` csak az egy webviewos ablakot adja vissza; az első böngészőfül után
+    // a főablaknak több webviewja van, ezért az ablakot közvetlenül kérjük el.
     let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "A főablak nem található.".to_string())?
-        .as_ref()
-        .window();
+        .get_window("main")
+        .ok_or_else(|| "A főablak nem található.".to_string())?;
 
     let nav_app = app.clone();
     let nav_label = label.clone();
