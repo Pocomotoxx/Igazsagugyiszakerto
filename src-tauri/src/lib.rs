@@ -1697,6 +1697,10 @@ fn run_site_search(
         result.source_type = platform.label.to_string();
         result.tier = platform.tier;
         result.relevance = (platform.relevance - (index as i32) * 2).max(55);
+        // a platform saját útvonalán belüli találat előrébb kerül
+        if !platform.path.is_empty() && result.url.contains(platform.path) {
+            result.relevance = (result.relevance + 5).min(100);
+        }
     }
     Ok(local)
 }
@@ -1868,6 +1872,23 @@ fn add_platform_cards(
                 platform.tier,
                 platform.source_type,
                 platform.relevance - 10,
+                original.to_string(),
+                "Megnyitás",
+            );
+        }
+        if !platform.landing.is_empty() {
+            push_detected_result(
+                results,
+                0,
+                &format!("{} – saját keresőoldal", platform.label),
+                platform.landing.to_string(),
+                format!(
+                    "A platform saját keresőoldala; a kifejezést itt kézzel kell megadni (a böngészőpanelben megnyitható). Javasolt kifejezés: {}",
+                    parsed.plain()
+                ),
+                platform.tier,
+                platform.source_type,
+                platform.relevance - 8,
                 original.to_string(),
                 "Megnyitás",
             );
@@ -4207,6 +4228,9 @@ mod tests {
         assert!(urls.iter().any(|u| u.contains("as_ylo=2020")));
         assert!(urls.iter().any(|u| u.contains("google.com/search") && u.contains("magyarkozlony.hu")));
         assert!(urls.iter().any(|u| u.contains("njt.hu")));
+        assert!(urls.iter().any(|u| *u == "https://eakta.birosag.hu/anonimizalt-hatarozatok"));
+        assert!(urls.iter().any(|u| *u == "https://kuria-birosag.hu/hu/jogegysegi-hatarozatok-hatalyos"));
+        assert!(urls.iter().any(|u| u.contains("google.com/search") && u.contains("eakta.birosag.hu")));
 
         let mut only_fb = Vec::new();
         add_platform_cards(&mut only_fb, original, &parsed, &["facebook".to_string()]);

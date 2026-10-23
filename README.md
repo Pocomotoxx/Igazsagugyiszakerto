@@ -78,7 +78,8 @@ A keresés nem keresőmotor-választással működik. Minden kérés minden beka
 | X (Twitter) | az évhatár `since:`/`until:` dátumhatárrá alakul |
 | YouTube | operátormentes keresőszöveg |
 | Facebook, Reddit | valódi webes keresés a domainre szűkítve + a platform saját keresője (operátormentesen) |
-| Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bírósági határozatok, Közbeszerzési Értesítő | valódi webes keresés a hivatalos domain(ek)re szűkítve + domainre szűkített Google-kártya |
+| Magyar Közlöny, Nemzeti Jogszabálytár, KSH, Bíróságok (birosag.hu), Közbeszerzési Értesítő | valódi webes keresés a hivatalos domain(ek)re szűkítve + domainre szűkített Google-kártya |
+| Anonimizált bírósági határozatok (eakta.birosag.hu), Kúria jogegységi határozatok | valódi webes keresés a platform saját útvonalára szűkítve (`site:domain/útvonal`) + domainre szűkített Google-kártya + a platform saját keresőoldala kártyaként (a kifejezést ott kézzel kell megadni) |
 | Magyar hírcsatornák (RSS) | 10 hírcsatorna közvetlen lekérése és szűrése a kifejezésre (ékezetfüggetlen, évtartománnyal), a csatorna saját közzétételi idejével |
 
 A domainre szűkített valódi keresés platformonként egy hívás az első beállított szolgáltatóval (Tavily, ennek hiányában Brave, majd Google CSE). Ha egyik sincs beállítva, a platformokhoz keresőkártya készül, a forrás-állapot mátrixban pedig „kikapcsolva” szerepel. A platformok a Haladó módban, a keresési panel „Platformok” kártyáján kapcsolhatók ki; a választás megmarad.

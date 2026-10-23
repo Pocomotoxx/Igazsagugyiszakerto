@@ -198,23 +198,29 @@ pub struct Platform {
     pub domains: &'static [&'static str],
     pub native: Native,
     pub relevance: i32,
+    /// Útvonal a domain alatt (pl. "/hu/jogegysegi-hatarozatok-hatalyos"): a `site:` szűrő ezt is tartalmazza.
+    pub path: &'static str,
+    /// A platform saját, kézzel kereshető oldala; keresőkártyaként is megjelenik.
+    pub landing: &'static str,
 }
 
 pub const PLATFORMS: &[Platform] = &[
-    Platform { id: "google", label: "Google", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Google, relevance: 92 },
-    Platform { id: "bing", label: "Bing", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Bing, relevance: 90 },
-    Platform { id: "duckduckgo", label: "DuckDuckGo", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Ddg, relevance: 88 },
-    Platform { id: "scholar", label: "Google Scholar", tier: 2, source_type: "Tudományos forrás", kind: Kind::Engine, domains: &[], native: Native::Scholar, relevance: 84 },
-    Platform { id: "youtube", label: "YouTube", tier: 4, source_type: "Videó", kind: Kind::Engine, domains: &[], native: Native::YouTube, relevance: 70 },
-    Platform { id: "x", label: "X (Twitter)", tier: 4, source_type: "Közösségi kontroll", kind: Kind::Engine, domains: &[], native: Native::X, relevance: 68 },
-    Platform { id: "facebook", label: "Facebook", tier: 4, source_type: "Közösségi kontroll", kind: Kind::Site, domains: &["facebook.com"], native: Native::Facebook, relevance: 72 },
-    Platform { id: "reddit", label: "Reddit", tier: 4, source_type: "Közösségi kontroll", kind: Kind::Site, domains: &["reddit.com"], native: Native::Reddit, relevance: 70 },
-    Platform { id: "magyar_kozlony", label: "Magyar Közlöny", tier: 1, source_type: "Hivatalos forrás", kind: Kind::Site, domains: &["magyarkozlony.hu"], native: Native::None, relevance: 94 },
-    Platform { id: "jogszabaly", label: "Nemzeti Jogszabálytár", tier: 1, source_type: "Hivatalos forrás", kind: Kind::Site, domains: &["njt.hu"], native: Native::None, relevance: 93 },
-    Platform { id: "ksh", label: "KSH", tier: 1, source_type: "Statisztikai forrás", kind: Kind::Site, domains: &["ksh.hu"], native: Native::None, relevance: 90 },
-    Platform { id: "birosag", label: "Bírósági határozatok", tier: 1, source_type: "Hivatalos forrás", kind: Kind::Site, domains: &["birosag.hu", "kuria-birosag.hu"], native: Native::None, relevance: 91 },
-    Platform { id: "kozbeszerzes", label: "Közbeszerzési Értesítő", tier: 1, source_type: "Hivatalos beszerzési forrás", kind: Kind::Site, domains: &["kozbeszerzes.hu"], native: Native::None, relevance: 89 },
-    Platform { id: "hu_rss", label: "Magyar hírcsatornák (RSS)", tier: 3, source_type: "Hírforrás (RSS)", kind: Kind::Rss, domains: &[], native: Native::None, relevance: 86 },
+    Platform { id: "google", label: "Google", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Google, relevance: 92, path: "", landing: "" },
+    Platform { id: "bing", label: "Bing", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Bing, relevance: 90, path: "", landing: "" },
+    Platform { id: "duckduckgo", label: "DuckDuckGo", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Ddg, relevance: 88, path: "", landing: "" },
+    Platform { id: "scholar", label: "Google Scholar", tier: 2, source_type: "Tudományos forrás", kind: Kind::Engine, domains: &[], native: Native::Scholar, relevance: 84, path: "", landing: "" },
+    Platform { id: "youtube", label: "YouTube", tier: 4, source_type: "Videó", kind: Kind::Engine, domains: &[], native: Native::YouTube, relevance: 70, path: "", landing: "" },
+    Platform { id: "x", label: "X (Twitter)", tier: 4, source_type: "Közösségi kontroll", kind: Kind::Engine, domains: &[], native: Native::X, relevance: 68, path: "", landing: "" },
+    Platform { id: "facebook", label: "Facebook", tier: 4, source_type: "Közösségi kontroll", kind: Kind::Site, domains: &["facebook.com"], native: Native::Facebook, relevance: 72, path: "", landing: "" },
+    Platform { id: "reddit", label: "Reddit", tier: 4, source_type: "Közösségi kontroll", kind: Kind::Site, domains: &["reddit.com"], native: Native::Reddit, relevance: 70, path: "", landing: "" },
+    Platform { id: "magyar_kozlony", label: "Magyar Közlöny", tier: 1, source_type: "Hivatalos forrás", kind: Kind::Site, domains: &["magyarkozlony.hu"], native: Native::None, relevance: 94, path: "", landing: "" },
+    Platform { id: "jogszabaly", label: "Nemzeti Jogszabálytár", tier: 1, source_type: "Hivatalos forrás", kind: Kind::Site, domains: &["njt.hu"], native: Native::None, relevance: 93, path: "", landing: "" },
+    Platform { id: "ksh", label: "KSH", tier: 1, source_type: "Statisztikai forrás", kind: Kind::Site, domains: &["ksh.hu"], native: Native::None, relevance: 90, path: "", landing: "" },
+    Platform { id: "birosag", label: "Bíróságok (birosag.hu)", tier: 1, source_type: "Hivatalos forrás", kind: Kind::Site, domains: &["birosag.hu"], native: Native::None, relevance: 91, path: "", landing: "" },
+    Platform { id: "eakta", label: "Anonimizált bírósági határozatok", tier: 1, source_type: "Bírósági határozat", kind: Kind::Site, domains: &["eakta.birosag.hu"], native: Native::None, relevance: 96, path: "/anonimizalt-hatarozatok", landing: "https://eakta.birosag.hu/anonimizalt-hatarozatok" },
+    Platform { id: "kuria_jogegyseg", label: "Kúria jogegységi határozatok", tier: 1, source_type: "Bírósági határozat", kind: Kind::Site, domains: &["kuria-birosag.hu"], native: Native::None, relevance: 95, path: "/hu/jogegysegi-hatarozatok-hatalyos", landing: "https://kuria-birosag.hu/hu/jogegysegi-hatarozatok-hatalyos" },
+    Platform { id: "kozbeszerzes", label: "Közbeszerzési Értesítő", tier: 1, source_type: "Hivatalos beszerzési forrás", kind: Kind::Site, domains: &["kozbeszerzes.hu"], native: Native::None, relevance: 89, path: "", landing: "" },
+    Platform { id: "hu_rss", label: "Magyar hírcsatornák (RSS)", tier: 3, source_type: "Hírforrás (RSS)", kind: Kind::Rss, domains: &[], native: Native::None, relevance: 86, path: "", landing: "" },
 ];
 
 pub fn enabled(enabled_ids: &[String], id: &str) -> bool {
@@ -273,11 +279,17 @@ fn with_site(ops: &str, parsed: &ParsedQuery) -> String {
 }
 
 /// Domainre szűkített Google-keresés URL-je (site:), operátorokkal és évhatárral.
-pub fn google_site_url(platform: &Platform, parsed: &ParsedQuery) -> String {
-    let sites = platform
+fn site_tokens(platform: &Platform) -> Vec<String> {
+    platform
         .domains
         .iter()
-        .map(|d| format!("site:{d}"))
+        .map(|d| format!("site:{d}{}", platform.path))
+        .collect()
+}
+
+pub fn google_site_url(platform: &Platform, parsed: &ParsedQuery) -> String {
+    let sites = site_tokens(platform)
+        .into_iter()
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut query = format!("{} ({sites})", parsed.with_operators());
@@ -294,11 +306,7 @@ pub fn google_site_url(platform: &Platform, parsed: &ParsedQuery) -> String {
 /// A webes keresőszolgáltatásnak (Tavily/Brave/CSE) küldendő lekérdezés egy site-platformra.
 /// A `site:` token ebből a szövegből kerül a szolgáltató domain-szűrőjébe.
 pub fn site_api_query(platform: &Platform, parsed: &ParsedQuery) -> String {
-    let sites = platform
-        .domains
-        .iter()
-        .map(|d| format!("site:{d}"))
-        .collect::<Vec<_>>();
+    let sites = site_tokens(platform);
     let group = if sites.len() > 1 {
         format!("({})", sites.join(" OR "))
     } else {
@@ -339,6 +347,14 @@ pub fn links(original: &str, enabled_ids: &[String]) -> Vec<PlatformLink> {
                 label: platform.label.to_string(),
                 url,
                 query,
+            });
+        }
+        if !platform.landing.is_empty() {
+            out.push(PlatformLink {
+                id: format!("{}_oldal", platform.id),
+                label: format!("{} – saját keresőoldal", platform.label),
+                url: platform.landing.to_string(),
+                query: parsed.plain(),
             });
         }
     }
@@ -402,10 +418,23 @@ mod tests {
         let p = parse_query("bírság \"közlekedési\" 2021..2023");
         let birosag = PLATFORMS.iter().find(|x| x.id == "birosag").unwrap();
         let q = site_api_query(birosag, &p);
-        assert!(q.contains("(site:birosag.hu OR site:kuria-birosag.hu)"), "{q}");
+        assert!(q.contains("site:birosag.hu"), "{q}");
         assert!(!q.contains("2021"));
         let url = google_site_url(birosag, &p);
         assert!(url.contains("2021") && url.contains("birosag.hu"));
+    }
+
+    #[test]
+    fn court_decision_platforms_use_their_path_and_landing_page() {
+        let p = parse_query("kártérítés");
+        let kuria = PLATFORMS.iter().find(|x| x.id == "kuria_jogegyseg").unwrap();
+        assert!(site_api_query(kuria, &p).contains("site:kuria-birosag.hu/hu/jogegysegi-hatarozatok-hatalyos"));
+        let eakta = PLATFORMS.iter().find(|x| x.id == "eakta").unwrap();
+        assert!(site_api_query(eakta, &p).contains("site:eakta.birosag.hu/anonimizalt-hatarozatok"));
+        let links = links("kártérítés", &[]);
+        let landing: Vec<&str> = links.iter().filter(|l| l.id.ends_with("_oldal")).map(|l| l.url.as_str()).collect();
+        assert!(landing.contains(&"https://eakta.birosag.hu/anonimizalt-hatarozatok"));
+        assert!(landing.contains(&"https://kuria-birosag.hu/hu/jogegysegi-hatarozatok-hatalyos"));
     }
 
     #[test]
