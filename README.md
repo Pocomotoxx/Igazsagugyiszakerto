@@ -54,60 +54,39 @@ A portable csomag automatikusan tartalmazza:
 
 A korábbi Python/pywebview előtanulmány kivezetésre került. A támogatott runtime most a `src-tauri` + `src` páros.
 
-## Előzmények, export és forrás-állapot (Haladó mód)
+## Keresés a böngészőben
 
-- **Szolgáltatói idő:** a találatok és az archivált források külön tárolják a közzététel, a módosítás, a megfigyelés (Wayback snapshot) és a begyűjtés idejét. A közzétételi időt a keresőszolgáltató, az oldal `<meta>`/`<time>` jelölése vagy a `Last-Modified` fejléc adja; ha egyik sincs, üres marad, a begyűjtés ideje nem helyettesíti. A frissesség (friss / elavult / ismeretlen) tier-függő küszöb szerint számolódik.
-- **Rekordvizsgáló:** az Előzmények fülön egy forrásra kattintva látszik az eredet, az időpontok, az integritás (az archivált fájl SHA-256 értéke a rögzítettel egyezik-e), a kapcsolódó rekordok (azonos tartalom, történet, domain, futam) és az auditesemények.
-- **Előzmények:** szűrés szöveg (ékezet- és kisbetű-független), domain, tier, státusz, döntés, típus és dátum szerint, idővonallal és lapozással.
-- **Export:** CSV (képletvédelemmel, Excel-barát), JSON, nyomtatható HTML és STIX 2.1; a szűrők az exportba is bekerülnek. A fájlok az adatmappa `exports/` könyvtárába kerülnek.
-- **Azonos történet:** a valódi webes találatok közül az egy témáról szólók egy szálba kerülnek (IDF-súlyozott, ékezet- és tőcsonkoló hasonlóság).
-- **Futamok összehasonlítása:** minden futam elmenti a találatlistáját; az új, a kiesett és a tier-t váltó találatok megjelennek az ismételt keresés után és az Előzmények fülön.
-- **Forrás-állapot mátrix:** futamonként látszik, hogy a natív terv, a Tavily, a Brave, a Google CSE és az AI lefutott-e, hány találatot adott és mennyi ideig tartott.
-- **Korlátos lekérés:** átmeneti hibánál (időtúllépés, 408/429/5xx) legfeljebb két újrapróbálás, a `Retry-After` tiszteletben tartásával; a méretkorlát miatt csonka letöltés jelölve van. Az AI-válasz sémaellenőrzött, hibás válasznál szabályalapú tartalék készül.
+A keresés a **Böngésző** fülön történik, úgy, mint egy böngészőben (a Windows alatt beépített WebView2 / Chromium motorral):
 
-Az ötletek a Crucix (AGPL-3.0) nyílt forráskódú projektből származnak; kód nem került átvételre, a megoldások önállóan, Rustban készültek.
+- A fül tetején a **Keresés minden platformon** mezőbe írt kifejezés minden bekapcsolt platformhoz külön **böngészőfület** nyit, a platform szintaxisára igazított lekérdezéssel:
 
-## Platformok: egy kérés, minden platformon
-
-A keresés nem keresőmotor-választással működik. Minden kérés minden bekapcsolt platformon lefut, és mindenhol a platform saját szintaxisára igazodik:
-
-| Platform | Mit csinál |
+| Platform | Lekérdezés |
 |---|---|
-| Google, Bing, DuckDuckGo | keresőkártya a platform operátoraival (Bingnél és DuckDuckGónál évhatár nélkül) |
+| Google, Google Hírek, Bing, DuckDuckGo | a saját keresőoldal, a Google az operátorokkal és az évhatárral |
 | Google Scholar | évszűrő a `as_ylo`/`as_yhi` paraméterekkel |
-| X (Twitter) | az évhatár `since:`/`until:` dátumhatárrá alakul |
-| YouTube | operátormentes keresőszöveg |
-| Facebook, Reddit | valódi webes keresés a domainre szűkítve + a platform saját keresője (operátormentesen) |
-| Magyar Közlöny, Nemzeti Jogszabálytár, KSH, Bíróságok (birosag.hu), Közbeszerzési Értesítő | valódi webes keresés a hivatalos domain(ek)re szűkítve + domainre szűkített Google-kártya |
-| Anonimizált bírósági határozatok (eakta.birosag.hu), Kúria jogegységi határozatok | valódi webes keresés a platform saját útvonalára szűkítve (`site:domain/útvonal`) + domainre szűkített Google-kártya + a platform saját keresőoldala kártyaként (a kifejezést ott kézzel kell megadni) |
-| Magyar hírcsatornák (RSS) | 10 hírcsatorna közvetlen lekérése és szűrése a kifejezésre (ékezetfüggetlen, évtartománnyal), a csatorna saját közzétételi idejével |
+| YouTube, Reddit | operátormentes keresőszöveg a platform saját keresőjében |
+| Facebook, X | domainre szűkített Google-keresés (így bejelentkezés nélkül is látszik) |
+| Magyar Közlöny, Nemzeti Jogszabálytár, KSH, Bíróságok, Közbeszerzési Értesítő | domainre szűkített Google-keresés |
+| Anonimizált bírósági határozatok (e-akta), Kúria jogegységi határozatok | útvonalra szűkített Google-keresés (`site:domain/útvonal`) + a platform saját keresőoldala |
 
-A domainre szűkített valódi keresés platformonként egy hívás az első beállított szolgáltatóval (Tavily, ennek hiányában Brave, majd Google CSE). Ha egyik sincs beállítva, a platformokhoz keresőkártya készül, a forrás-állapot mátrixban pedig „kikapcsolva” szerepel. A platformok a Haladó módban, a keresési panel „Platformok” kártyáján kapcsolhatók ki; a választás megmarad.
-
-### Kulcs nélküli működés és a találatok pontossága
-
-- Ha egyik webes keresőszolgáltatás (Tavily, Brave, Google CSE) sincs beállítva, a valódi találatokat a DuckDuckGo HTML-oldala adja kulcs nélkül (ha az hibázik vagy üres, a Bing HTML-oldala), szándékosan lassan (időközzel, a korlátozás jelzésével). Ez tartalék: ingadozhat, ezért a felület jelzi, honnan jönnek a találatok. Megbízható működéshez érdemes egy ingyenes Tavily-kulcs.
-- A keresési eredmények tetején a valódi találatok állnak, utánuk a keresőkártyák; a lista fölött látszik a kettő darabszáma.
-- Az RSS-szűrés szóhatáron kezdődő egyezést keres (ragozott alak igen, a szó közepe nem): a „takarítás” nem találja meg az „időmegtakarítás” szót.
-
-### Böngészős keresés (kulcs nélkül)
-
-Ha nincs beállítva Tavily, Brave vagy Google CSE kulcs, az alkalmazás a beépített Chromiummal (WebView2) keres: egy képernyőn kívüli ablakban betölti a Google találati oldalát (ellenőrzés vagy üres válasz esetén a Binget), és a találatokat az oldalról olvassa ki. A kérés az általános lekérdezésre és minden bekapcsolt, domainre szűkíthető platformra egymás után fut, 1,2 másodperc időközzel. A visszajuttatás IPC nélkül történik (az oldalba injektált szkript egy elfogott, megszakított navigációval adja át a találatokat), ezért a betöltött oldal nem fér hozzá az alkalmazás parancsaihoz.
-
-- **Első indításkor** a Google hozzájárulási oldala megjelenhet; a szkript elfogadja. Ha a Google captchát kér, a futam hátralévő része Bingen fut, és a „Források" sorban hiba látszik. Ilyenkor a Böngésző fülön nyisd meg a Google-t, és oldd meg egyszer az ellenőrzést: a böngészőpanel és a keresőablak közös profilt használ.
-- A böngészős keresés lassabb az API-nál (platformonként néhány másodperc), és a találatok a Google aktuális oldalszerkezetétől függnek. Ha a Google átalakítja az oldalt, a kiolvasó szkriptet (`src-tauri/src/scrape.rs`) kell frissíteni. Tartós használathoz egy ingyenes Tavily-kulcs gyorsabb és stabilabb.
-
-### Eredmények platformonként (fülek)
-
-A keresési találatok a lista fölötti fülekre oszlanak: „Összes", majd platformonként egy-egy fül (Webes találatok, Facebook, Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bíróságok, RSS stb.). A fül számlálója a valódi találatok száma (zöld), vagy ha csak keresőkártya van, a kártyák száma (szürke).
-
-## Keresés a böngészőben (aktuális működés)
-
-A korábbi „Keresési Futam" fül megszűnt; a keresés a **Böngésző** fülön történik, úgy, mint egy böngészőben:
-
-- A fül tetején a **Keresés minden platformon** mezőbe írt kifejezés minden bekapcsolt platformhoz külön **böngészőfület** nyit, a platform saját szintaxisára igazított lekérdezéssel: Google, Google Hírek, Bing, DuckDuckGo, Google Scholar, YouTube, Reddit, Facebook és X (domainre szűkített Google-keresésen át, így bejelentkezés nélkül is látszik), Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bíróságok, anonimizált határozatok (e-akta), Kúria jogegységi határozatok, Közbeszerzési Értesítő, valamint a bírósági keresőoldalak saját oldala.
 - A fülek **lustán töltődnek**: az első azonnal betölt, a többi akkor, amikor rákattintasz. A fül a platform nevét viseli.
 - A **Platformok** menüben kapcsolhatók ki a platformok; a választás megmarad.
-- Az **Archiválás** gomb az aktív fül *megjelenített* szövegét menti (azt, amit látsz, bejelentkezést kérő oldalon is), a hash-elt archívumba, a közzétételi/módosítási idővel, amennyiben az oldal jelzi. Az archiválás az aktuális keresési futamhoz kapcsolódik, így az Előzmények és az export is látja.
-- Minden keresés rögzítődik futamként (a megnyitott címekkel), és az audit napló is tartalmazza.
+- Az **Archiválás** gomb az aktív fül *megjelenített* szövegét menti (azt, amit látsz, bejelentkezést kérő oldalon is) a hash-elt archívumba, az oldal által jelzett közzétételi és módosítási idővel. A mentés az aktuális keresési futamhoz kapcsolódik.
+- Minden keresés futamként rögzítődik (a megnyitott címekkel), és az audit napló is tartalmazza.
 - A Google hozzájárulási oldalát vagy captchát egyszer kell elfogadni/megoldani a böngészőfülön.
+
+A találatok visszajuttatása (archiváláskor) IPC nélkül történik: az oldalba injektált szkript egy megszakított navigációval adja át a szöveget, ezért a betöltött idegen oldal nem fér hozzá az alkalmazás parancsaihoz.
+
+## Egyszerű és Haladó mód
+
+Az **Egyszerű** mód (alapértelmezett) a napi munka fülei: Ügyek, Böngésző, Archivum, Riport. A **Haladó** mód ezen felül a Bemutató, az Előzmények és az Audit fület mutatja.
+
+## Előzmények és export (Haladó mód)
+
+- **Szolgáltatói idő:** az archivált források külön tárolják a közzététel, a módosítás, a megfigyelés (Wayback snapshot) és a begyűjtés idejét. A közzétételi időt az oldal jelzése adja (`<meta>`, `<time>`); ha nincs, üres marad, a begyűjtés ideje nem helyettesíti. A frissesség (friss / elavult / ismeretlen) tier-függő küszöb szerint számolódik.
+- **Rekordvizsgáló:** egy forrásra kattintva látszik az eredet, az időpontok, az integritás (az archivált fájl SHA-256 értéke a rögzítettel egyezik-e), a kapcsolódó rekordok (azonos tartalom, történet, domain, futam) és az auditesemények.
+- **Előzmények:** szűrés szöveg (ékezet- és kisbetű-független), domain, tier, státusz, döntés, típus és dátum szerint, idővonallal és lapozással.
+- **Export:** CSV (képletvédelemmel, Excel-barát), JSON, nyomtatható HTML és STIX 2.1; a szűrők az exportba is bekerülnek. A fájlok az adatmappa `exports/` könyvtárába kerülnek.
+- **Futamok összehasonlítása:** minden futam elmenti a megnyitott címeit; az új, a kiesett és a tier-t váltó elemek az Előzmények fülön hasonlíthatók össze.
+
+Az ötletek egy része a Crucix (AGPL-3.0) nyílt forráskódú projektből származik; kód nem került átvételre, a megoldások önállóan, Rustban készültek.

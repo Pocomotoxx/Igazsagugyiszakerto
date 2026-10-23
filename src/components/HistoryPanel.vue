@@ -22,15 +22,9 @@ const exportedPath = ref("");
 const compareA = ref(null);
 const compareB = ref(null);
 const delta = ref(null);
-const healthRows = ref([]);
 
 const pageCount = computed(() => Math.max(1, Math.ceil(data.value.total / PAGE_SIZE)));
 const maxDay = computed(() => Math.max(1, ...data.value.timeline.map((point) => point.count)));
-const providerIds = computed(() => {
-  const ids = new Map();
-  healthRows.value.forEach((row) => (row.providers || []).forEach((p) => ids.set(p.id, p.label)));
-  return Array.from(ids.entries());
-});
 
 async function call(command, args) {
   try {
@@ -52,11 +46,6 @@ async function load() {
   });
   if (result) data.value = result;
   loading.value = false;
-}
-
-async function loadHealth() {
-  if (!props.caseId) return;
-  healthRows.value = (await call("get_source_health", { caseId: props.caseId, limit: 12 })) || [];
 }
 
 function applyFilters() {
@@ -113,25 +102,13 @@ const integrityClass = (state) =>
     : state === "eltér"
       ? "border-rose-300 bg-rose-50 text-rose-800"
       : "border-amber-300 bg-amber-50 text-amber-800";
-const stateClass = (state) =>
-  state === "ok"
-    ? "bg-emerald-100 text-emerald-800"
-    : state === "hiba"
-      ? "bg-rose-100 text-rose-800"
-      : "bg-slate-100 text-slate-500";
-
-function cell(row, id) {
-  return (row.providers || []).find((p) => p.id === id);
-}
 
 onMounted(() => {
   load();
-  loadHealth();
 });
 watch(() => props.caseId, () => {
   inspection.value = null;
   load();
-  loadHealth();
 });
 watch(page, load);
 </script>
@@ -339,36 +316,6 @@ watch(page, load);
         </div>
       </div>
       <p v-if="!searchRuns.length" class="mt-3 text-xs text-slate-500">Még nincs rögzített keresési futam ebben az ügyben.</p>
-    </div>
-
-    <!-- Forrás-állapot mátrix -->
-    <div class="rounded-3xl border border-slate-200 bg-white/85 p-5">
-      <div class="flex items-center justify-between">
-        <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Forrás-állapot mátrix (utolsó futamok)</div>
-        <button @click="loadHealth" class="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold">Frissítés</button>
-      </div>
-      <div v-if="healthRows.length && providerIds.length" class="mt-3 overflow-x-auto">
-        <table class="w-full text-left text-xs">
-          <thead>
-            <tr class="text-slate-500">
-              <th class="py-1 pr-3 font-semibold">Futam</th>
-              <th v-for="[id, label] in providerIds" :key="id" class="py-1 pr-3 font-semibold">{{ label }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="row in healthRows" :key="row.run_id" class="border-t border-slate-100">
-              <td class="py-1.5 pr-3 font-mono text-[11px]">#{{ row.run_id }} <span class="text-slate-400">{{ row.created_at }}</span></td>
-              <td v-for="[id] in providerIds" :key="id" class="py-1.5 pr-3">
-                <span v-if="cell(row, id)" :class="stateClass(cell(row, id).state)" class="rounded-full px-2 py-0.5 font-semibold" :title="cell(row, id).error">
-                  {{ cell(row, id).state }}{{ cell(row, id).state === "ok" ? ` · ${cell(row, id).count}` : "" }}
-                </span>
-                <span v-else class="text-slate-300">—</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <p v-else class="mt-3 text-xs text-slate-500">Az állapotadatok az új keresési futamokkal kezdenek gyűlni.</p>
     </div>
   </div>
 </template>

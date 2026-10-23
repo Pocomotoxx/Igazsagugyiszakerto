@@ -1,7 +1,7 @@
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import HelpTooltip from "./components/HelpTooltip.vue";
 import SourceReviewPanel from "./components/SourceReviewPanel.vue";
 import BrowserPanel from "./components/BrowserPanel.vue";
@@ -42,64 +42,18 @@ function setUiMode(mode) {
   }
 }
 
-const engines = [
-  { id: "google", label: "Google", note: "Széles recall, gyors első futam." },
-  { id: "bing", label: "Bing", note: "Eltérő indexelés, más találati sorrend." },
-  { id: "duckduckgo", label: "DuckDuckGo", note: "Más rangsorolás, jó kontrollkör." },
-];
-
-const searchModes = [
-  { id: "native", label: "Natív böngésző alapú", note: "Kereső- és forrásnyitási terv; ha be van állítva keresési API (Tavily, CSE, Brave), valódi webes találatokkal kiegészítve." },
-  { id: "hybrid", label: "AI + natív böngésző", note: "A natív futamot (terv + valódi találatok) AI keresési javaslatokkal egészíti ki." },
-  { id: "ai_only", label: "Csak AI API", note: "A futam kizárólag AI-alapú keresési és ellenőrzési javaslatokat ad, keresési API-k nélkül." },
-];
-
-const aiProviders = [
-  { id: "openai", label: "OpenAI" },
-  { id: "openrouter", label: "OpenRouter" },
-  { id: "gemini", label: "Google Gemini" },
-];
-
-const nativeRunModes = [
-  { id: "broad", label: "Széles webes futam", note: "Minimális szűrés, valódi Google/Bing recall." },
-  { id: "filtered", label: "Szűrt szakértői futam", note: "Forráscsomagokkal és szakértői szűkítéssel." },
-  { id: "combined", label: "Kombinált futam", note: "Széles és szűrt futam együtt." },
-];
-
-const tierOptions = [
-  { value: 0, label: "Minden tier" },
-  { value: 1, label: "Csak Tier 1 - Hivatalos" },
-  { value: 2, label: "Tier 1-2 - Hivatalos és tudományos" },
-  { value: 3, label: "Tier 1-3 - Piaci / keresőig" },
-  { value: 4, label: "Tier 1-4 - Kontrollal együtt" },
-];
-
-const presets = [
-  { id: "haztartas", label: "Háztartási munka", must: "háztartási munka", phrase: "óradíj" },
-  { id: "gondozas", label: "Gondozás", must: "házi gondozás", phrase: "óradíj" },
-  { id: "takaritas", label: "Takarítás", must: "takarítás", phrase: "óradíj" },
-  { id: "bebi", label: "Bébiszitter", must: "bébiszitter", phrase: "óradíj" },
-  { id: "mezogazdasag", label: "Mezőgazdasági gépi munka", must: "mezőgazdasági gépi munka", phrase: "órabér" },
-];
-
 const cases = ref([]);
 const currentCase = ref(null);
 const currentTab = ref("cases");
 const sources = ref([]);
 const auditLogs = ref([]);
 const searchRuns = ref([]);
-const searchResults = ref([]);
-const selectedRunIds = ref([]);
 const activeSearchRunId = ref(null);
 const archiveRunFilter = ref("all");
 const archiveStatusFilter = ref("all");
 const archiveDecisionFilter = ref("all");
 const archivePriorityFilter = ref("all");
 const archiveOriginFilter = ref("all");
-const expandedResultKeys = ref({});
-const expandedRunIds = ref({});
-const searchPlanExpanded = ref(false);
-const runNoteDrafts = ref({});
 const sourceReviewDrafts = ref({});
 const caseOpinionDraft = ref({
   preliminary_opinion: "",
@@ -109,22 +63,14 @@ const caseOpinionDraft = ref({
   open_questions: "",
   closed_points: "",
 });
-const selectedEngines = ref(["google", "bing"]);
-const selectedTierFilter = ref(0);
-const isSearching = ref(false);
 const isSavingReport = ref(false);
-const busyArchiveId = ref(null);
 const reportPath = ref("");
 const reportSaved = ref(false);
-const lastSearchSummary = ref("");
 const appError = ref("");
 const searchWarning = ref("");
-const searchDiagnostics = ref(null);
-const runDelta = ref(null);
 
 const PLATFORMS_KEY = "irbr-platforms";
 const platformList = ref([]);
-const platformLinks = ref([]);
 function loadEnabledPlatforms() {
   try {
     const raw = JSON.parse(localStorage.getItem(PLATFORMS_KEY) || "[]");
@@ -135,9 +81,6 @@ function loadEnabledPlatforms() {
 }
 // üres lista = minden platform bekapcsolva
 const enabledPlatforms = ref(loadEnabledPlatforms());
-const isPlatformEnabled = (id) => enabledPlatforms.value.length === 0 || enabledPlatforms.value.includes(id);
-const activePlatformCount = computed(() => platformList.value.filter((p) => isPlatformEnabled(p.id)).length);
-const platformQuery = (id) => platformLinks.value.find((link) => link.id === id)?.query || "";
 
 function togglePlatform(id) {
   const all = platformList.value.map((p) => p.id);
@@ -152,381 +95,14 @@ function togglePlatform(id) {
   }
 }
 
-let platformLinksTimer = null;
-async function refreshPlatformLinks() {
-  const query = broadQuery.value.trim();
-  if (!query) {
-    platformLinks.value = [];
-    return;
-  }
-  try {
-    platformLinks.value = await api("platform_links", { query, enabledPlatforms: enabledPlatforms.value });
-  } catch {
-    platformLinks.value = [];
-  }
-}
-const searchHealth = ref([]);
-const expandedStories = ref({});
-
-const stateRank = { hiba: 3, ok: 2, kihagyva: 1, kikapcsolva: 0 };
-
-function mergeHealth(outputs) {
-  const merged = new Map();
-  outputs.flatMap((output) => output.health || []).forEach((entry) => {
-    const current = merged.get(entry.id);
-    if (!current) {
-      merged.set(entry.id, { ...entry });
-      return;
-    }
-    current.count += entry.count;
-    current.ms += entry.ms;
-    if ((stateRank[entry.state] ?? 0) > (stateRank[current.state] ?? 0)) current.state = entry.state;
-    if (entry.error && !current.error) current.error = entry.error;
-  });
-  return Array.from(merged.values());
-}
-
-const realHitCount = computed(
-  () => searchResults.value.filter((item) => item.evidence_level === "RETRIEVED").length,
-);
-const cardCount = computed(() => searchResults.value.length - realHitCount.value);
-const activeHealth = computed(() => searchHealth.value.filter((e) => e.state === "ok" || e.state === "hiba"));
-const inactiveHealthCount = computed(() => searchHealth.value.length - activeHealth.value.length);
-const ddgEntry = computed(() => searchHealth.value.find((e) => e.id === "browser" || e.id === "ddg"));
-
-const resultTab = ref("all");
-const EXTRA_TAB_LABELS = { web: "Webes találatok", ai: "AI javaslatok", egyeb: "További források" };
-const platformKey = (item) => item.platform || "egyeb";
-
-const resultTabs = computed(() => {
-  const counts = new Map();
-  searchResults.value.forEach((item) => {
-    const key = platformKey(item);
-    const entry = counts.get(key) || { total: 0, real: 0 };
-    entry.total += 1;
-    if (item.evidence_level === "RETRIEVED") entry.real += 1;
-    counts.set(key, entry);
-  });
-  const order = ["web", ...platformList.value.map((p) => p.id), "egyeb", "ai"];
-  const labelOf = (id) => platformList.value.find((p) => p.id === id)?.label || EXTRA_TAB_LABELS[id] || id;
-  const tabs = order
-    .filter((id, index) => counts.has(id) && order.indexOf(id) === index)
-    .map((id) => ({ id, label: labelOf(id), ...counts.get(id) }));
-  const real = searchResults.value.filter((item) => item.evidence_level === "RETRIEVED").length;
-  return [{ id: "all", label: "Összes", total: searchResults.value.length, real }, ...tabs];
-});
-
-const visibleResults = computed(() => {
-  const seen = new Set();
-  const inTab = searchResults.value.filter(
-    (item) => resultTab.value === "all" || platformKey(item) === resultTab.value,
-  );
-  return inTab.filter((result) => {
-    if (!result.story_id || result.story_size < 2) return true;
-    if (expandedStories.value[result.story_id]) return true;
-    if (seen.has(result.story_id)) return false;
-    seen.add(result.story_id);
-    return true;
-  });
-});
-
-function hiddenInStory(result) {
-  if (!result.story_id || result.story_size < 2) return 0;
-  return expandedStories.value[result.story_id] ? 0 : result.story_size - 1;
-}
-
-function toggleStory(result) {
-  expandedStories.value = {
-    ...expandedStories.value,
-    [result.story_id]: !expandedStories.value[result.story_id],
-  };
-}
-
-const freshnessClass = (value) =>
-  value === "friss"
-    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-    : value === "elavult"
-      ? "border-amber-200 bg-amber-50 text-amber-700"
-      : "border-slate-200 bg-slate-50 text-slate-500";
-
-const healthClass = (state) =>
-  state === "ok"
-    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-    : state === "hiba"
-      ? "border-rose-200 bg-rose-50 text-rose-700"
-      : "border-slate-200 bg-slate-50 text-slate-500";
-
-const formatDay = (iso) => (iso ? iso.slice(0, 10) : "");
-
 const newCaseTitle = ref("");
 const newCaseDesc = ref("");
 const newCaseDeadline = ref("");
 
-const searchTerms = ref({
-  mustInclude: "",
-  exactPhrase: "",
-  anyOf: "",
-  exclude: "",
-  site: "",
-  region: "",
-  yearFrom: "",
-  yearTo: "",
-});
 const rawQuery = ref("");
-const sourcePacks = ref({
-  official: true,
-  science: true,
-  market: true,
-  archive: true,
-  reddit: false,
-  facebook_groups: true,
-  shared: false,
-  community_general: false,
-  control: false,
-});
-const researchLens = ref("balanced");
-const searchMode = ref("native");
-const nativeRunMode = ref("combined");
-const settingsSaved = ref(false);
-const cseSettings = ref({
-  api_key: "",
-  api_key_set: false,
-  cx: "",
-});
-const braveSettings = ref({
-  api_key: "",
-  api_key_set: false,
-});
-const tavilySettings = ref({
-  api_key: "",
-  api_key_set: false,
-});
-const aiSettings = ref({
-  ai_provider: "openai",
-  api_key: "",
-  api_key_set: false,
-  ai_model: "gpt-4o-mini",
-  system_prompt:
-    "Te egy igazsagugyi szakerto munkajat tamogato kutatasi asszisztens vagy. Adj rovid, gyakorlatias keresesi javaslatokat, ellenorzesi szempontokat, keresokifejezes-variantokat es lehetoseg szerint relevans forrashelyeket. JSON formatumban valaszolj.",
-});
 
 async function api(command, args = {}) {
   return invoke(command, args);
-}
-
-const aiConfigured = computed(
-  () => aiSettings.value.api_key.trim().length > 0 || aiSettings.value.api_key_set,
-);
-
-const cseConfigured = computed(
-  () =>
-    cseSettings.value.cx.trim().length > 0 &&
-    (cseSettings.value.api_key.trim().length > 0 || cseSettings.value.api_key_set),
-);
-
-const braveConfigured = computed(
-  () => braveSettings.value.api_key.trim().length > 0 || braveSettings.value.api_key_set,
-);
-
-const tavilyConfigured = computed(
-  () => tavilySettings.value.api_key.trim().length > 0 || tavilySettings.value.api_key_set,
-);
-
-const sourcePackMeta = {
-  official: {
-    label: "Hivatalos",
-    domains: ["site:njt.hu", "site:magyarkozlony.hu", "site:ksh.hu", "site:kozbeszerzes.hu"],
-    info: "njt.hu, magyarkozlony.hu, ksh.hu, kozbeszerzes.hu",
-    note: "Jogszabályok, közlönyök, statisztikák és közbeszerzési értesítők.",
-  },
-  science: {
-    label: "Tudományos",
-    domains: ["site:scholar.google.com", "site:ncbi.nlm.nih.gov"],
-    info: "scholar.google.com, ncbi.nlm.nih.gov",
-    note: "Tudományos publikációk és módszertani háttéranyagok.",
-  },
-  market: {
-    label: "Piaci",
-    domains: ["site:profession.hu", "site:allasok.hu", "site:jooble.org"],
-    info: "profession.hu, allasok.hu, jooble.org",
-    note: "Munkaerőpiaci és piaci kontrollforrások.",
-  },
-  archive: {
-    label: "Webarchív",
-    domains: ["site:archive.org"],
-    info: "archive.org",
-    note: "Internet Archive és archivált dokumentumváltozatok.",
-  },
-  reddit: {
-    label: "Reddit kontroll",
-    domains: ["site:reddit.com"],
-    info: "reddit.com",
-    note: "Közösségi kontroll és gyakorlati tapasztalatok.",
-  },
-  facebook_groups: {
-    label: "Facebook csoportok",
-    domains: ["site:facebook.com/groups", "site:facebook.com"],
-    info: "facebook.com/groups, facebook.com",
-    note: "Nyilvánosan indexelt Facebook csoportok és oldalak.",
-  },
-  shared: {
-    label: "Megosztott",
-    domains: ["site:drive.google.com", "site:docs.google.com"],
-    info: "drive.google.com, docs.google.com",
-    note: "Megosztott dokumentumok, táblázatok és prezentációk.",
-  },
-  community_general: {
-    label: "Általános közösségi kontroll",
-    domains: ["site:facebook.com", "site:jofogas.hu"],
-    info: "facebook.com, jofogas.hu",
-    note: "Vegyes közösségi és piactéri kontrollréteg.",
-  },
-  control: {
-    label: "Vegyes kontroll",
-    domains: ["site:jofogas.hu", "site:facebook.com"],
-    info: "jofogas.hu, facebook.com",
-    note: "Gyors ellenőrző kontrollforrások.",
-  },
-};
-
-const sourcePackQueries = Object.fromEntries(
-  Object.entries(sourcePackMeta).map(([key, value]) => [key, value.domains]),
-);
-
-const selectedSourcePackKeys = computed(() =>
-  Object.entries(sourcePacks.value)
-    .filter(([, enabled]) => enabled)
-    .map(([key]) => key),
-);
-
-const selectedSourcePackSummary = computed(() => {
-  if (selectedSourcePackKeys.value.length === 0) {
-    return "Nincs forráscsomag kiválasztva, ezért a rendszer széles webes keresést használ.";
-  }
-
-  return selectedSourcePackKeys.value
-    .map((key) => {
-      const meta = sourcePackMeta[key];
-      return `${meta?.label || key}: ${meta?.info || ""}`;
-    })
-    .join(" | ");
-});
-
-async function loadAppSettings() {
-  const settings = await api("get_app_settings");
-  searchMode.value = settings.search_mode || "native";
-  aiSettings.value = {
-    ai_provider: settings.ai_provider || "openai",
-    api_key: "",
-    api_key_set: Boolean(settings.api_key_set),
-    ai_model: settings.ai_model || "gpt-4o-mini",
-    system_prompt: settings.system_prompt || aiSettings.value.system_prompt,
-  };
-  cseSettings.value = {
-    api_key: "",
-    api_key_set: Boolean(settings.google_cse_key_set),
-    cx: settings.google_cse_cx || "",
-  };
-  braveSettings.value = {
-    api_key: "",
-    api_key_set: Boolean(settings.brave_key_set),
-  };
-  tavilySettings.value = {
-    api_key: "",
-    api_key_set: Boolean(settings.tavily_key_set),
-  };
-}
-
-async function saveAppSettings() {
-  try {
-    await api("save_app_settings", {
-      searchMode: searchMode.value,
-      aiProvider: aiSettings.value.ai_provider,
-      apiKey: aiSettings.value.api_key,
-      aiModel: aiSettings.value.ai_model,
-      systemPrompt: aiSettings.value.system_prompt,
-      googleCseKey: cseSettings.value.api_key,
-      googleCseCx: cseSettings.value.cx,
-      braveKey: braveSettings.value.api_key,
-      tavilyKey: tavilySettings.value.api_key,
-    });
-    if (aiSettings.value.api_key.trim()) {
-      aiSettings.value.api_key_set = true;
-      aiSettings.value.api_key = "";
-    }
-    if (cseSettings.value.api_key.trim()) {
-      cseSettings.value.api_key_set = true;
-      cseSettings.value.api_key = "";
-    }
-    if (braveSettings.value.api_key.trim()) {
-      braveSettings.value.api_key_set = true;
-      braveSettings.value.api_key = "";
-    }
-    if (tavilySettings.value.api_key.trim()) {
-      tavilySettings.value.api_key_set = true;
-      tavilySettings.value.api_key = "";
-    }
-    settingsSaved.value = true;
-    appError.value = "";
-    setTimeout(() => {
-      settingsSaved.value = false;
-    }, 2500);
-  } catch (error) {
-    appError.value = `Beállítás mentési hiba: ${String(error)}`;
-  }
-}
-
-function buildYearClause(yearFrom, yearTo) {
-  const start = Number.parseInt(yearFrom, 10);
-  const end = Number.parseInt(yearTo, 10);
-
-  if (Number.isNaN(start) && Number.isNaN(end)) {
-    return "";
-  }
-
-  const currentYear = new Date().getFullYear();
-  const effectiveStart = Number.isNaN(start) ? null : start;
-  const effectiveEnd = Number.isNaN(end) ? null : end;
-
-  if (effectiveStart !== null && effectiveEnd !== null && effectiveEnd >= effectiveStart) {
-    if (effectiveEnd - effectiveStart <= 6) {
-      return `(${Array.from({ length: effectiveEnd - effectiveStart + 1 }, (_, index) => effectiveStart + index).join(" OR ")})`;
-    }
-    return `${effectiveStart}..${effectiveEnd}`;
-  }
-
-  if (effectiveStart !== null) {
-    if (currentYear - effectiveStart <= 6 && currentYear >= effectiveStart) {
-      return `(${Array.from({ length: currentYear - effectiveStart + 1 }, (_, index) => effectiveStart + index).join(" OR ")})`;
-    }
-    return `after:${effectiveStart}`;
-  }
-
-  return `before:${effectiveEnd}`;
-}
-
-function buildExternalSearchUrl(engine, query) {
-  const encoded = encodeURIComponent(query);
-  if (engine === "bing") return `https://www.bing.com/search?q=${encoded}`;
-  if (engine === "duckduckgo") return `https://duckduckgo.com/?q=${encoded}`;
-  return `https://www.google.com/search?q=${encoded}`;
-}
-
-function buildFallbackSearchResults(query) {
-  return selectedEngines.value.map((engine) => ({
-    title: `${engines.find((item) => item.id === engine)?.label || engine} keresés indítása`,
-    url: buildExternalSearchUrl(engine, query),
-    original_url: "",
-    archived_url: "",
-    archive_kind: "live",
-    snapshot_timestamp: "",
-    snippet: "Védőháló találat: közvetlen keresőnyitás ugyanarra a lekérdezésre, ha a generált terv valamiért nem adott vissza kártyát.",
-    tier: 3,
-    source_type: "Keresőmotor",
-    relevance: 100,
-    query_used: query,
-    action_label: "Megnyitás",
-  }));
 }
 
 onMounted(async () => {
@@ -537,7 +113,6 @@ onMounted(async () => {
     } catch {
       platformList.value = [];
     }
-    await loadAppSettings();
     await loadCases();
   } catch (error) {
     appError.value = `Inicializációs hiba: ${String(error)}`;
@@ -570,163 +145,6 @@ watch(currentCase, async (value) => {
   };
 });
 
-const broadQuery = computed(() => {
-  if (rawQuery.value.trim()) {
-    return rawQuery.value.trim();
-  }
-
-  const parts = [];
-  if (searchTerms.value.mustInclude.trim()) {
-    parts.push(searchTerms.value.mustInclude.trim());
-  }
-  if (searchTerms.value.exactPhrase.trim()) {
-    parts.push(`"${searchTerms.value.exactPhrase.trim()}"`);
-  }
-  if (searchTerms.value.anyOf.trim()) {
-    parts.push(`(${searchTerms.value.anyOf.trim().split(/\s+/).join(" OR ")})`);
-  }
-  if (searchTerms.value.exclude.trim()) {
-    parts.push(
-      searchTerms.value.exclude
-        .trim()
-        .split(/\s+/)
-        .map((term) => `-${term}`)
-        .join(" "),
-    );
-  }
-  if (searchTerms.value.site.trim()) {
-    parts.push(`site:${searchTerms.value.site.trim()}`);
-  }
-  if (searchTerms.value.region.trim()) {
-    parts.push(searchTerms.value.region.trim());
-  }
-  const yearClause = buildYearClause(searchTerms.value.yearFrom.trim(), searchTerms.value.yearTo.trim());
-  if (yearClause) {
-    parts.push(yearClause);
-  }
-
-  return parts.join(" ").trim();
-});
-
-const constructedQuery = computed(() => broadQuery.value);
-
-watch([broadQuery, enabledPlatforms], () => {
-  clearTimeout(platformLinksTimer);
-  platformLinksTimer = setTimeout(refreshPlatformLinks, 300);
-});
-
-const sourcePackLabels = {
-  official: "Hivatalos források",
-  science: "Tudományos források",
-  market: "Piaci források",
-  archive: "Webarchív",
-  reddit: "Reddit kontroll",
-  facebook_groups: "Facebook csoportok",
-  shared: "Megosztott dokumentumok",
-  community_general: "Általános közösségi",
-  control: "Kontrollforrások",
-};
-
-const lensClause = computed(() => {
-  if (researchLens.value === "pricing") {
-    return "(árlista OR óradíj OR bérkalkuláció OR díjtáblázat)";
-  }
-  if (researchLens.value === "legal") {
-    return "(jogszabály OR módszertan OR iránymutatás OR szakvélemény)";
-  }
-  if (researchLens.value === "operations") {
-    return "(költség OR normatíva OR üzemeltetés OR hatékonyság)";
-  }
-  return "";
-});
-
-function buildScopedBaseQuery() {
-  const base = broadQuery.value;
-  if (!base) return "";
-  return lensClause.value ? `${base} ${lensClause.value}` : base;
-}
-
-const filteredQueries = computed(() => {
-  const base = buildScopedBaseQuery();
-  if (!base) return [];
-
-  const queries = [];
-
-  if (searchTerms.value.site.trim()) {
-    queries.push({
-      label: "Cél domain",
-      query: base,
-      info: `Kézi domainkorlát: ${searchTerms.value.site.trim()}`,
-      note: "A keresés a kézzel megadott cél domainre van korlátozva.",
-    });
-  } else if (selectedSourcePackKeys.value.length > 0) {
-    selectedSourcePackKeys.value.forEach((key) => {
-      const terms = sourcePackQueries[key] || [];
-      const meta = sourcePackMeta[key] || {};
-      if (terms.length === 0) return;
-      queries.push({
-        label: meta.label || sourcePackLabels[key] || key,
-        query: `${base} (${terms.join(" OR ")})`,
-        info: meta.info || terms.join(", "),
-        note: meta.note || "Csak a kiválasztott forráscsomag oldalain futó keresés.",
-      });
-    });
-  } else {
-    queries.push({
-      label: "Széles webes futam",
-      query: base,
-      info: "Nincs forráscsomag-korlát",
-      note: "Széles webes keresés forráscsomag-szűkítés nélkül.",
-    });
-  }
-
-  const seen = new Set();
-  return queries.filter(({ query }) => {
-    if (seen.has(query) || query === base) return false;
-    seen.add(query);
-    return true;
-  });
-});
-
-const GOOGLE_WORD_LIMIT = 32;
-
-function countQueryWords(query) {
-  return query.split(/\s+/).filter(Boolean).length;
-}
-
-const queryWordWarnings = computed(() => {
-  const warnings = [];
-  if (broadQuery.value && countQueryWords(broadQuery.value) > GOOGLE_WORD_LIMIT) {
-    warnings.push(`A széles alaplekérdezés ${countQueryWords(broadQuery.value)} szóból áll.`);
-  }
-  filteredQueries.value.forEach(({ label, query }) => {
-    const count = countQueryWords(query);
-    if (count > GOOGLE_WORD_LIMIT) {
-      warnings.push(`A(z) "${label}" szűrt lekérdezés ${count} szóból áll.`);
-    }
-  });
-  return warnings;
-});
-
-const searchPlan = computed(() => {
-  if (filteredQueries.value.length === 0) return [];
-
-  const plans = [];
-  filteredQueries.value.forEach(({ label, query, info, note }) => {
-    plans.push({
-      title: `${plans.length + 1}. Forráskorlátozott futam: ${label}`,
-      note: `${note || "Csak a kiválasztott forráscsomag oldalain futó keresés."} Keresett oldalak: ${info || "nincs külön megadva"}.`,
-      query,
-    });
-  });
-
-  return plans;
-});
-
-const browserPlanSuggestions = computed(() =>
-  platformLinks.value.map((link) => ({ title: link.label, url: link.url })),
-);
-
 const archiveInsights = computed(() => {
   const tierCounts = { 1: 0, 2: 0, 3: 0, 4: 0 };
   const domainCounts = new Map();
@@ -752,13 +170,6 @@ const archiveInsights = computed(() => {
     duplicatedDomains,
     missingTiers,
   };
-});
-
-const selectedRunComparison = computed(() => {
-  if (selectedRunIds.value.length < 2) return [];
-  return selectedRunIds.value
-    .map((id) => searchRuns.value.find((run) => run.id === id))
-    .filter(Boolean);
 });
 
 const archiveGroups = computed(() => {
@@ -918,10 +329,6 @@ function getOriginCaution(origin) {
   return "";
 }
 
-function isWaybackResult(result) {
-  return result.archive_kind === "wayback_snapshot" || result.archive_kind === "wayback_index";
-}
-
 function formatReportStatus(status) {
   if (status === "ellenorzes_alatt") return "Ellenőrzés alatt";
   if (status === "veglegesitett") return "Véglegesített";
@@ -930,33 +337,6 @@ function formatReportStatus(status) {
 
 function formatFinalizable(value) {
   return value === "igen" ? "Igen" : "Nem";
-}
-
-function getSearchResultKey(result) {
-  return `${result.url}-${result.query_used}`;
-}
-
-function isResultExpanded(result) {
-  return Boolean(expandedResultKeys.value[getSearchResultKey(result)]);
-}
-
-function toggleResultExpanded(result) {
-  const key = getSearchResultKey(result);
-  expandedResultKeys.value = {
-    ...expandedResultKeys.value,
-    [key]: !expandedResultKeys.value[key],
-  };
-}
-
-function isRunExpanded(runId) {
-  return Boolean(expandedRunIds.value[runId]);
-}
-
-function toggleRunExpanded(runId) {
-  expandedRunIds.value = {
-    ...expandedRunIds.value,
-    [runId]: !expandedRunIds.value[runId],
-  };
 }
 
 function applyQuickReview(source, patch) {
@@ -1179,21 +559,21 @@ const reportText = computed(() => {
     currentCase.value.description || "A felhasználó nem adott meg részletes ügyösszefoglalót.",
   );
   lines.push("");
-  lines.push("## 4. Utolsó keresési futam");
-  lines.push(lastSearchSummary.value || "Még nem történt keresési futam ebben a munkamenetben.");
-  lines.push("");
-  lines.push("## 5. Javasolt keresési és ellenőrzési sorrend");
-
-  if (searchPlan.value.length === 0) {
-    lines.push("- Nincs összeállított keresési terv.");
+  lines.push("## 4. Keresési futamok");
+  if (searchRuns.value.length === 0) {
+    lines.push("Még nem történt keresési futam ebben az ügyben.");
   } else {
-    searchPlan.value.forEach((plan) => {
-      lines.push(`### ${plan.title}`);
-      lines.push(`- Munkacél: ${plan.note}`);
-      lines.push(`- Lekérdezés: \`${plan.query}\``);
-      lines.push("");
+    searchRuns.value.slice(0, 10).forEach((run) => {
+      lines.push(`- ${run.created_at} | \`${run.base_query}\` | ${run.summary}`);
+      if (run.note?.trim()) lines.push(`  - Szakértői megjegyzés: ${run.note.trim()}`);
     });
   }
+  lines.push("");
+  lines.push("## 5. Keresési és ellenőrzési sorrend");
+  lines.push(
+    "- A kérés minden bekapcsolt platformon (Google, Google Hírek, Facebook, Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bíróságok stb.) külön böngészőfülön futott, a platform szintaxisára igazított lekérdezéssel.",
+  );
+  lines.push("");
 
   lines.push("## 6. Ügyszintű döntéstámogatás");
   if (caseSummary.value.findings.length === 0) {
@@ -1518,7 +898,6 @@ async function loadAuditLogs() {
 async function loadSearchRuns() {
   if (!currentCase.value) return;
   searchRuns.value = await api("get_search_runs", { caseId: currentCase.value.id });
-  runNoteDrafts.value = Object.fromEntries(searchRuns.value.map((run) => [run.id, run.note || ""]));
 }
 
 async function handleCreateCase() {
@@ -1555,87 +934,6 @@ async function handleDeleteCase(id) {
     await loadCases();
   } catch (error) {
     appError.value = `Törlési hiba: ${String(error)}`;
-  }
-}
-
-function applyPreset(preset) {
-  searchTerms.value.mustInclude = preset.must;
-  searchTerms.value.exactPhrase = preset.phrase;
-}
-
-function clearSearchForm() {
-  rawQuery.value = "";
-  searchTerms.value = {
-    mustInclude: "",
-    exactPhrase: "",
-    anyOf: "",
-    exclude: "",
-    site: "",
-    region: "",
-    yearFrom: "",
-    yearTo: "",
-  };
-  sourcePacks.value = {
-    official: true,
-    science: true,
-    market: true,
-    archive: true,
-    reddit: false,
-    facebook_groups: true,
-    shared: false,
-    community_general: false,
-    control: false,
-  };
-  researchLens.value = "balanced";
-  searchResults.value = [];
-  lastSearchSummary.value = "";
-  searchWarning.value = "";
-  searchDiagnostics.value = null;
-  searchRuns.value = currentCase.value ? searchRuns.value : [];
-  selectedRunIds.value = [];
-  activeSearchRunId.value = null;
-  archiveRunFilter.value = "all";
-  archiveStatusFilter.value = "all";
-  archiveDecisionFilter.value = "all";
-  archivePriorityFilter.value = "all";
-  archiveOriginFilter.value = "all";
-}
-
-function parseRunSummary(summary) {
-  const enginesMatch = summary.match(/Motorok:\s(.+?)\.\sTalálatok:/);
-  const resultMatch = summary.match(/Találatok:\s(\d+)/);
-  const planMatch = summary.match(/Keresési terv-lépések:\s(\d+)/);
-
-  return {
-    engines: enginesMatch ? enginesMatch[1].split(",").map((item) => item.trim()).filter(Boolean) : ["google"],
-    resultCount: resultMatch ? Number.parseInt(resultMatch[1], 10) : 0,
-    planCount: planMatch ? Number.parseInt(planMatch[1], 10) : 0,
-  };
-}
-
-function applySearchRun(run) {
-  rawQuery.value = run.base_query;
-  const parsed = parseRunSummary(run.summary);
-  selectedEngines.value = parsed.engines.length ? parsed.engines : ["google"];
-  selectedTierFilter.value = run.tier_filter;
-  lastSearchSummary.value = `Korábbi futam betöltve: ${run.summary}`;
-  activeSearchRunId.value = run.id;
-}
-
-async function rerunSearchRun(run) {
-  applySearchRun(run);
-  await runSearch();
-}
-
-async function saveRunNote(run) {
-  try {
-    await api("update_search_run_note", {
-      id: run.id,
-      note: runNoteDrafts.value[run.id] || "",
-    });
-    await Promise.all([loadSearchRuns(), loadAuditLogs()]);
-  } catch (error) {
-    appError.value = `Futam-megjegyzés mentési hiba: ${String(error)}`;
   }
 }
 
@@ -1698,253 +996,6 @@ async function saveSourceReview(source) {
   }
 }
 
-function toggleRunComparison(runId) {
-  if (selectedRunIds.value.includes(runId)) {
-    selectedRunIds.value = selectedRunIds.value.filter((id) => id !== runId);
-    return;
-  }
-  if (selectedRunIds.value.length >= 2) {
-    selectedRunIds.value = [selectedRunIds.value[1], runId];
-    return;
-  }
-  selectedRunIds.value = [...selectedRunIds.value, runId];
-}
-
-function toggleEngine(engineId) {
-  if (selectedEngines.value.includes(engineId)) {
-    if (selectedEngines.value.length > 1) {
-      selectedEngines.value = selectedEngines.value.filter((item) => item !== engineId);
-    }
-    return;
-  }
-  selectedEngines.value = [...selectedEngines.value, engineId];
-}
-
-function buildQuerySet() {
-  // Minden kérés minden bekapcsolt platformon lefut; a platformonkénti igazítást a backend végzi.
-  const base = broadQuery.value.trim();
-  return base ? [base] : [];
-}
-
-function buildQuerySetLegacy() {
-  const broad = broadQuery.value.trim();
-  const filtered = filteredQueries.value.map((item) => item.query);
-  const hasPackScope = !searchTerms.value.site.trim() && selectedSourcePackKeys.value.length > 0;
-
-  if (!broad) return [];
-
-  if (searchMode.value === "ai_only") {
-    return [broad];
-  }
-
-  if (nativeRunMode.value === "broad") {
-    return hasPackScope ? (filtered.length > 0 ? filtered : [broad]) : [broad];
-  }
-
-  if (nativeRunMode.value === "filtered") {
-    return filtered.length > 0 ? filtered : [broad];
-  }
-
-  return hasPackScope ? (filtered.length > 0 ? filtered : [broad]) : [broad, ...filtered];
-}
-
-async function runSearch() {
-  if (!currentCase.value) {
-    appError.value = "Keresés előtt hozz létre vagy válassz ki egy ügyet.";
-    currentTab.value = "cases";
-    return;
-  }
-
-  const querySet = buildQuerySet();
-  if (querySet.length === 0) return;
-  const primaryQuery = querySet[0];
-
-  if (searchMode.value === "ai_only" && !aiConfigured.value) {
-    appError.value = "AI módhoz előbb ments el egy érvényes API kulcsot a keresési beállításoknál.";
-    return;
-  }
-
-  isSearching.value = true;
-  appError.value = "";
-  searchWarning.value = "";
-  searchDiagnostics.value = null;
-  runDelta.value = null;
-  resultTab.value = "all";
-  expandedStories.value = {};
-  expandedResultKeys.value = {};
-
-  try {
-    const calls = [];
-
-    if (searchMode.value !== "ai_only") {
-      calls.push(
-        api("execute_search", {
-          caseId: currentCase.value.id,
-          searchQuery: primaryQuery,
-          tierFilter: selectedTierFilter.value,
-          engine: "google",
-          searchMode: "native",
-          includeCse: true,
-          selectedSourcePacks: [],
-          enabledPlatforms: enabledPlatforms.value,
-        }),
-      );
-    }
-
-    if (searchMode.value !== "native") {
-      calls.push(
-        api("execute_search", {
-          caseId: currentCase.value.id,
-          searchQuery: primaryQuery,
-          tierFilter: selectedTierFilter.value,
-          engine: "google",
-          searchMode: "ai_only",
-          includeCse: false,
-          selectedSourcePacks: [],
-          enabledPlatforms: enabledPlatforms.value,
-        }),
-      );
-    }
-
-    const settledOutputs = await Promise.allSettled(calls);
-    const outputs = settledOutputs
-      .filter((item) => item.status === "fulfilled")
-      .map((item) => item.value);
-    const failedOutputs = settledOutputs
-      .filter((item) => item.status === "rejected")
-      .map((item) => String(item.reason));
-
-    if (outputs.length === 0) {
-      throw new Error(failedOutputs[0] || "A keresési futamok nem adtak vissza feldolgozható eredményt.");
-    }
-
-    const merged = outputs.flatMap((output) => output.results);
-    const aiErrors = outputs.map((output) => output.ai_error).filter(Boolean);
-    const cseErrors = outputs.map((output) => output.cse_error).filter(Boolean);
-    const braveErrors = outputs.map((output) => output.brave_error).filter(Boolean);
-    const tavilyErrors = outputs.map((output) => output.tavily_error).filter(Boolean);
-    const generatedCount = outputs.reduce((sum, output) => sum + (output.generated_count || 0), 0);
-    const filteredOutCount = outputs.reduce((sum, output) => sum + (output.filtered_out_count || 0), 0);
-
-    const unique = new Map();
-    merged.forEach((result) => {
-      const previous = unique.get(result.url);
-      if (!previous || previous.relevance < result.relevance) {
-        unique.set(result.url, result);
-      }
-    });
-
-    // A valódi találatok előre kerülnek, utánuk a keresőkártyák; mindkét csoporton belül relevancia szerint.
-    const isReal = (item) => (item.evidence_level === "RETRIEVED" ? 1 : 0);
-    searchResults.value = Array.from(unique.values()).sort(
-      (left, right) => isReal(right) - isReal(left) || right.relevance - left.relevance,
-    );
-    searchHealth.value = mergeHealth(outputs);
-
-    // Azonos történetek összevonása a teljes (több lekérdezésből összeállt) listán.
-    const retrievedIdx = searchResults.value
-      .map((item, index) => (item.evidence_level === "RETRIEVED" ? index : -1))
-      .filter((index) => index >= 0);
-    if (retrievedIdx.length > 1) {
-      try {
-        const ids = await api("cluster_stories", {
-          texts: retrievedIdx.map((i) => `${searchResults.value[i].title} ${searchResults.value[i].snippet}`),
-        });
-        const sizes = new Map();
-        ids.forEach((id) => sizes.set(id, (sizes.get(id) || 0) + 1));
-        retrievedIdx.forEach((resultIndex, position) => {
-          searchResults.value[resultIndex].story_id = ids[position] + 1;
-          searchResults.value[resultIndex].story_size = sizes.get(ids[position]);
-        });
-      } catch {
-        // az összevonás csak kényelmi funkció; hiba esetén a találatok önállóak maradnak
-      }
-    }
-    searchDiagnostics.value = {
-      generated: generatedCount,
-      filteredOut: filteredOutCount,
-      kept: searchResults.value.length,
-    };
-
-    const warningParts = [];
-    if (aiErrors.length > 0) {
-      warningParts.push(`Az AI kiegészítés nem futott le, a natív találatok viszont megmaradtak. Hiba: ${aiErrors[0]}`);
-    }
-    if (cseErrors.length > 0) {
-      warningParts.push(`A Google CSE valódi találatlekérés nem futott le, a keresési terv kártyái megmaradtak. Hiba: ${cseErrors[0]}`);
-    }
-    if (braveErrors.length > 0) {
-      warningParts.push(`A Brave Search valódi találatlekérés nem futott le, a keresési terv kártyái megmaradtak. Hiba: ${braveErrors[0]}`);
-    }
-    if (tavilyErrors.length > 0) {
-      warningParts.push(`A Tavily valódi találatlekérés nem futott le, a keresési terv kártyái megmaradtak. Hiba: ${tavilyErrors[0]}`);
-    }
-    if (failedOutputs.length > 0) {
-      warningParts.push(`A keresési részfutamok közül ${failedOutputs.length} hibával leállt, de a sikeres találatok megmaradtak. Első hiba: ${failedOutputs[0]}`);
-    }
-    searchWarning.value = warningParts.join(" | ");
-
-    if (searchResults.value.length === 0) {
-      searchResults.value = buildFallbackSearchResults(primaryQuery);
-      appError.value =
-        filteredOutCount > 0
-          ? `A futam ${generatedCount} kártyát generált, de a Tier-szűrő mindet elrejtette. Közvetlen keresőnyitási védőháló jelent meg – érdemes a Tier-szűrőt lazítani.`
-          : "A generált keresési terv nem adott vissza találatkártyát, ezért közvetlen keresőnyitási védőháló jelent meg.";
-    }
-    lastSearchSummary.value =
-      `Mód: ${searchModes.find((item) => item.id === searchMode.value)?.label || searchMode.value}. ` +
-      `${searchMode.value === "native" ? `Natív futam: ${nativeRunModes.find((item) => item.id === nativeRunMode.value)?.label || nativeRunMode.value}. ` : ""}` +
-      `Elsődleges lekérdezés: ${primaryQuery}. Platformok: ${activePlatformCount.value}. ` +
-      `Találatok: ${searchResults.value.length}. Keresési terv-lépések: ${platformLinks.value.length}.`;
-    activeSearchRunId.value = await api("record_search_run", {
-      caseId: currentCase.value.id,
-      summary: lastSearchSummary.value,
-      baseQuery: querySet.join(" || "),
-      engine: `${searchMode.value} | ${enabledPlatforms.value.length ? enabledPlatforms.value.join(", ") : "minden platform"} | ${aiSettings.value.ai_provider}`,
-      tierFilter: selectedTierFilter.value,
-      planCount: platformLinks.value.length,
-      resultCount: searchResults.value.length,
-      results: searchResults.value.map((item) => ({
-        url: item.url,
-        title: item.title,
-        tier: item.tier,
-        source_type: item.source_type || "",
-        query_used: item.query_used || "",
-        published_at: item.published_at || "",
-        evidence_level: item.evidence_level || "",
-        story_id: item.story_id || 0,
-      })),
-      health: searchHealth.value,
-    });
-    try {
-      runDelta.value = await api("previous_run_delta", {
-        caseId: currentCase.value.id,
-        runId: activeSearchRunId.value,
-      });
-    } catch {
-      runDelta.value = null;
-    }
-    await Promise.all([loadAuditLogs(), loadSearchRuns()]);
-  } catch (error) {
-    appError.value = `Keresési hiba: ${String(error)}`;
-  } finally {
-    isSearching.value = false;
-  }
-}
-
-async function resetTierFilterAndRerun() {
-  selectedTierFilter.value = 0;
-  await runSearch();
-}
-
-async function openSearchResult(result) {
-  try {
-    await openUrl(result.url);
-  } catch (error) {
-    appError.value = `A hivatkozás megnyitása sikertelen: ${String(error)}`;
-  }
-}
-
 async function openInBrowserPanel({ url, title }) {
   if (!currentCase.value) {
     appError.value = "A böngésző használatához válassz aktív ügyet.";
@@ -1956,16 +1007,6 @@ async function openInBrowserPanel({ url, title }) {
     currentTab.value = "browser";
   } catch (error) {
     appError.value = `A böngészőfül megnyitása sikertelen: ${String(error)}`;
-  }
-}
-
-async function openResultInViewer(result) {
-  await openInBrowserPanel({ url: result.url, title: result.title });
-}
-
-async function openSearchPlanInBrowser() {
-  for (const item of browserPlanSuggestions.value) {
-    await openInBrowserPanel(item);
   }
 }
 
@@ -2005,7 +1046,6 @@ async function runBrowserSearch(query) {
         evidence_level: "CONSTRUCTED",
         story_id: 0,
       })),
-      health: [],
     });
     for (let index = 0; index < links.length; index += 1) {
       await openBrowserTab({
@@ -2056,131 +1096,6 @@ async function archiveBrowserTab(tab) {
     notice.value = `Archiválva: ${title}`;
   } catch (error) {
     appError.value = `Az oldal archiválása sikertelen: ${String(error)}`;
-  }
-}
-
-function isSearchEngineUrl(url) {
-  try {
-    const host = new URL(url).hostname.replace(/^www\./, "");
-    return (
-      host === "google.com" ||
-      host.endsWith(".google.com") ||
-      host === "bing.com" ||
-      host === "duckduckgo.com"
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function openQueryInGoogle(query) {
-  if (!query?.trim()) return;
-
-  try {
-    await openUrl(buildExternalSearchUrl("google", query.trim()));
-  } catch (error) {
-    appError.value = `A Google keresés megnyitása sikertelen: ${String(error)}`;
-  }
-}
-
-async function copyQueryToClipboard(query) {
-  if (!query?.trim()) return;
-
-  try {
-    await navigator.clipboard.writeText(query.trim());
-    appError.value = "";
-  } catch (error) {
-    appError.value = `A lekérdezés másolása sikertelen: ${String(error)}`;
-  }
-}
-
-async function archiveResult(result) {
-  return archiveResultVariant(result, "current");
-}
-
-async function archiveResultVariant(result, variant = "current") {
-  if (!currentCase.value) return;
-
-  if (!activeSearchRunId.value) {
-    appError.value = "Archiválás előtt futtass le vagy tölts be egy keresési futamot.";
-    return;
-  }
-
-  const targetUrl =
-    variant === "original" && result.original_url?.trim() ? result.original_url.trim() : result.url;
-  const archiveLabel =
-    variant === "original" && result.original_url?.trim()
-      ? `${result.title} [élő forrás]`
-      : result.title;
-  const archiveKind =
-    variant === "original" && result.original_url?.trim() ? "live" : result.archive_kind;
-
-  busyArchiveId.value = `${result.url}|${variant}`;
-  try {
-    let fetchedSection = "";
-    let pageTimes = { published_at: result.published_at || "", modified_at: "", time_source: result.published_at ? "provider" : "" };
-    if (!isSearchEngineUrl(targetUrl)) {
-      try {
-        const page = await api("fetch_page_text", { url: targetUrl });
-        if (page.published_at || page.modified_at) {
-          pageTimes = {
-            published_at: page.published_at || pageTimes.published_at,
-            modified_at: page.modified_at || "",
-            time_source: page.published_at ? page.time_source : pageTimes.time_source || page.time_source,
-          };
-        }
-        if (page.text?.trim()) {
-          fetchedSection = [
-            "",
-            "--- Letöltött oldaltartalom (automatikus kivonat) ---",
-            `Oldal címe: ${page.title || "nincs cím"}`,
-            `HTTP státusz: ${page.status}`,
-            `Végleges URL: ${page.final_url}`,
-            page.truncated ? "FIGYELEM: a letöltés a méretkorlát miatt csonka." : "",
-            page.published_at ? `Közzétéve (oldal jelzése): ${page.published_at}` : "",
-            page.modified_at ? `Módosítva (oldal jelzése): ${page.modified_at}` : "",
-            "",
-            page.text,
-          ].join("\n");
-        }
-      } catch {
-        fetchedSection = [
-          "",
-          "--- Letöltött oldaltartalom ---",
-          "Az oldal automatikus letöltése nem sikerült, az archívum a találatkártya kivonatát tartalmazza.",
-        ].join("\n");
-      }
-    }
-
-    await api("archive_source", {
-      caseId: currentCase.value.id,
-      searchRunId: activeSearchRunId.value,
-      title: archiveLabel,
-      url: targetUrl,
-      tier: result.tier,
-      publishedAt: pageTimes.published_at || null,
-      modifiedAt: pageTimes.modified_at || null,
-      timeSource: pageTimes.time_source || null,
-      content: [
-        `Cím: ${archiveLabel}`,
-        `URL: ${targetUrl}`,
-        `Eredeti URL: ${result.original_url || targetUrl}`,
-        `Archivált URL: ${result.archived_url || ""}`,
-        `Snapshot: ${result.snapshot_timestamp || ""}`,
-        `Archiválási nézet: ${archiveKind}`,
-        `Tier: ${result.tier}`,
-        `Forrástípus: ${result.source_type}`,
-        `Lekérdezés: ${result.query_used}`,
-        "",
-        result.snippet,
-        fetchedSection,
-      ].join("\n"),
-    });
-    await Promise.all([loadSources(), loadAuditLogs()]);
-  } catch (error) {
-    appError.value = `Archiválási hiba: ${String(error)}`;
-  } finally {
-    busyArchiveId.value = null;
   }
 }
 

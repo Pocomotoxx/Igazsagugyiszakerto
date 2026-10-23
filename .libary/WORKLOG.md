@@ -330,3 +330,8 @@ Szabály:
 - Új parancsok: `list_platforms`, `platform_links`; az `execute_search` kapott `enabled_platforms` paramétert.
 - Platformonkénti forrás-állapot sorok a mátrixban.
 
+### M-Takarítás - holt kód kivezetése
+- A korábbi API-s és kulcs nélküli keresés (Tavily, Brave, Google CSE, DuckDuckGo/Bing HTML, RSS, AI-javaslatok), az API-kulcs-kezelés (DPAPI) és a hozzá tartozó felület kikerült; a keresés a böngészőben történik.
+- Törölt Rust-modulok: `ddg`, `bing`, `scrape`, `rss`, `fetchx`; a `lib.rs` 4757 sorról kb. 1500-ra, az `App.vue` 3300 sorról kb. 1900-ra csökkent.
+- A `reqwest` függőség elhagyható lett.
+

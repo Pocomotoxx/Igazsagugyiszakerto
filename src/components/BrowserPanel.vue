@@ -18,8 +18,6 @@ const props = defineProps({
   platforms: { type: Array, default: () => [] },
   enabledIds: { type: Array, default: () => [] },
   initialQuery: { type: String, default: "" },
-  // Üres panelnél ide kerülnek a javasolt indítóoldalak (pl. a keresési terv lépései).
-  suggestions: { type: Array, default: () => [] },
 });
 const emit = defineEmits(["open-url", "archive", "error", "search", "toggle-platform"]);
 
@@ -277,14 +275,6 @@ async function run(action) {
       <div v-if="!activeTab" class="flex h-full flex-col items-center justify-center gap-4 p-6 text-center">
         <div class="text-lg font-semibold text-slate-700">IRBR böngésző</div>
         <div class="max-w-md text-sm text-slate-500">Írj be egy keresést fent: minden platformhoz (Google, Facebook, Magyar Közlöny, Nemzeti Jogszabálytár, bíróságok stb.) külön fül nyílik a találataival.</div>
-        <div v-if="suggestions.length" class="flex max-w-2xl flex-wrap justify-center gap-2">
-          <button
-            v-for="item in suggestions"
-            :key="item.url"
-            class="rounded-full border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:border-slate-400 hover:bg-slate-50"
-            @click="emit('open-url', item)"
-          >{{ item.title }}</button>
-        </div>
       </div>
     </div>
   </div>

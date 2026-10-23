@@ -689,57 +689,7 @@ pub fn compare_runs(conn: &Connection, run_a: i64, run_b: i64) -> Result<RunDelt
     })
 }
 
-/// Az ugyanahhoz az ügyhöz és alaplekérdezéshez tartozó, közvetlenül megelőző futam.
-pub fn previous_run_id(conn: &Connection, case_id: i64, run_id: i64) -> Result<Option<i64>, String> {
-    let base: Option<String> = conn
-        .query_row(
-            "SELECT base_query FROM search_runs WHERE id = ?1 AND case_id = ?2",
-            params![run_id, case_id],
-            |row| row.get(0),
-        )
-        .ok();
-    let Some(base) = base else { return Ok(None) };
-    let previous: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM search_runs WHERE case_id = ?1 AND base_query = ?2 AND id < ?3 ORDER BY id DESC LIMIT 1",
-            params![case_id, base, run_id],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(previous)
-}
-
 // ---- Forrás-állapot mátrix ----
-
-#[derive(Serialize, Debug)]
-pub struct HealthRow {
-    pub run_id: i64,
-    pub created_at: String,
-    pub summary: String,
-    pub providers: serde_json::Value,
-}
-
-pub fn health_matrix(conn: &Connection, case_id: i64, limit: i64) -> Result<Vec<HealthRow>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, created_at, summary, health FROM search_runs WHERE case_id = ?1 ORDER BY id DESC LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![case_id, limit.clamp(1, 100)], |row| {
-            let raw: Option<String> = row.get(3)?;
-            Ok(HealthRow {
-                run_id: row.get(0)?,
-                created_at: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                summary: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                providers: raw
-                    .and_then(|r| serde_json::from_str(&r).ok())
-                    .unwrap_or_else(|| serde_json::json!([])),
-            })
-        })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
-}
 
 #[cfg(test)]
 mod tests {
@@ -875,29 +825,6 @@ mod tests {
         assert_eq!(delta.tier_changes.len(), 1);
         assert_eq!(delta.tier_changes[0].from, 2);
         assert_eq!(delta.tier_changes[0].to, 1);
-    }
-
-    #[test]
-    fn previous_run_matches_case_and_query() {
-        let c = conn();
-        for (case, q) in [(1, "x"), (1, "y"), (1, "x"), (2, "x")] {
-            c.execute("INSERT INTO search_runs (case_id, created_at, summary, base_query) VALUES (?1,'t','s',?2)", params![case, q]).unwrap();
-        }
-        assert_eq!(previous_run_id(&c, 1, 3).unwrap(), Some(1));
-        assert_eq!(previous_run_id(&c, 1, 1).unwrap(), None);
-        assert_eq!(previous_run_id(&c, 2, 4).unwrap(), None);
-    }
-
-    #[test]
-    fn health_matrix_parses_json() {
-        let c = conn();
-        c.execute(
-            "INSERT INTO search_runs (case_id, created_at, summary, base_query, health) VALUES (1,'t','s','q','[{\"id\":\"brave\",\"state\":\"ok\"}]')",
-            [],
-        )
-        .unwrap();
-        let rows = health_matrix(&c, 1, 10).unwrap();
-        assert_eq!(rows[0].providers[0]["state"], "ok");
     }
 
     #[test]
