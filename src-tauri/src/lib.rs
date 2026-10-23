@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const MAX_SEARCH_QUERY_LEN: usize = 2000;
 const ENCRYPTED_SECRET_PREFIX: &str = "dpapi:";
@@ -2795,6 +2795,208 @@ async fn open_viewer_window(
     Ok(())
 }
 
+// ---- Beépített böngészőpanel (több webview a főablakban) ----
+
+const BROWSER_LABEL_PREFIX: &str = "browser-";
+
+#[derive(Clone, serde::Serialize)]
+struct BrowserNavEvent {
+    label: String,
+    url: String,
+    loading: bool,
+}
+
+fn browser_label(tab_id: &str) -> Result<String, String> {
+    if tab_id.is_empty() || !tab_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("Érvénytelen böngészőfül-azonosító.".to_string());
+    }
+    Ok(format!("{BROWSER_LABEL_PREFIX}{tab_id}"))
+}
+
+fn parse_browser_url(url: &str) -> Result<tauri::Url, String> {
+    let parsed: tauri::Url = url
+        .trim()
+        .parse()
+        .map_err(|e| format!("Érvénytelen URL: {e}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("A beépített böngészőben csak http vagy https URL nyitható meg.".to_string());
+    }
+    Ok(parsed)
+}
+
+#[tauri::command]
+async fn browser_open_tab(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    tab_id: String,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    let parsed = parse_browser_url(&url)?;
+
+    if app.get_webview(&label).is_some() {
+        return Err("Ez a böngészőfül már létezik.".to_string());
+    }
+
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "A főablak nem található.".to_string())?
+        .as_ref()
+        .window();
+
+    let nav_app = app.clone();
+    let nav_label = label.clone();
+    let load_app = app.clone();
+    let load_label = label.clone();
+
+    let builder = tauri::webview::WebviewBuilder::new(&label, tauri::WebviewUrl::External(parsed))
+        .on_navigation(move |target| {
+            let allowed = target.scheme() == "http" || target.scheme() == "https";
+            if allowed {
+                let _ = nav_app.emit(
+                    "browser-nav",
+                    BrowserNavEvent {
+                        label: nav_label.clone(),
+                        url: target.to_string(),
+                        loading: true,
+                    },
+                );
+            }
+            allowed
+        })
+        .on_page_load(move |_webview, payload| {
+            let loading = matches!(payload.event(), tauri::webview::PageLoadEvent::Started);
+            let _ = load_app.emit(
+                "browser-nav",
+                BrowserNavEvent {
+                    label: load_label.clone(),
+                    url: payload.url().to_string(),
+                    loading,
+                },
+            );
+        });
+
+    window
+        .add_child(
+            builder,
+            tauri::LogicalPosition::new(x, y),
+            tauri::LogicalSize::new(width.max(1.0), height.max(1.0)),
+        )
+        .map_err(|e| format!("A böngészőfül megnyitása sikertelen: {e}"))?;
+
+    log_action(
+        &state.db_path,
+        case_id,
+        "browser_tab_opened",
+        &url,
+        "Oldal megnyitva a beépített böngészőben.",
+    )?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_set_bounds(
+    app: tauri::AppHandle,
+    tab_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    let Some(webview) = app.get_webview(&label) else {
+        return Ok(());
+    };
+    webview
+        .set_position(tauri::LogicalPosition::new(x, y))
+        .map_err(|e| e.to_string())?;
+    webview
+        .set_size(tauri::LogicalSize::new(width.max(1.0), height.max(1.0)))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_set_visible(
+    app: tauri::AppHandle,
+    tab_id: String,
+    visible: bool,
+) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    let Some(webview) = app.get_webview(&label) else {
+        return Ok(());
+    };
+    if visible {
+        webview.show().map_err(|e| e.to_string())
+    } else {
+        webview.hide().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+async fn browser_hide_all(app: tauri::AppHandle) -> Result<(), String> {
+    for (label, webview) in app.webviews() {
+        if label.starts_with(BROWSER_LABEL_PREFIX) {
+            let _ = webview.hide();
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_navigate(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    tab_id: String,
+    url: String,
+) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    let parsed = parse_browser_url(&url)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "A böngészőfül nem található.".to_string())?;
+    webview.navigate(parsed).map_err(|e| e.to_string())?;
+    log_action(
+        &state.db_path,
+        case_id,
+        "browser_navigated",
+        &url,
+        "Navigálás a beépített böngészőben.",
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn browser_action(app: tauri::AppHandle, tab_id: String, action: String) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "A böngészőfül nem található.".to_string())?;
+    let script = match action.as_str() {
+        "back" => "history.back()",
+        "forward" => "history.forward()",
+        "reload" => "location.reload()",
+        _ => return Err("Ismeretlen böngészőművelet.".to_string()),
+    };
+    webview.eval(script).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn browser_close_tab(app: tauri::AppHandle, tab_id: String) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    if let Some(webview) = app.get_webview(&label) {
+        webview.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn extract_tag_content(html: &str, lower: &str, tag: &str) -> Option<String> {
     let open_pos = lower.find(&format!("<{tag}"))?;
     let content_start = open_pos + lower[open_pos..].find('>')? + 1;
@@ -3073,6 +3275,13 @@ pub fn run() {
             execute_search,
             archive_source,
             open_viewer_window,
+            browser_open_tab,
+            browser_set_bounds,
+            browser_set_visible,
+            browser_hide_all,
+            browser_navigate,
+            browser_action,
+            browser_close_tab,
             fetch_page_text,
             save_report
         ])

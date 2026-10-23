@@ -4,11 +4,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import HelpTooltip from "./components/HelpTooltip.vue";
 import SourceReviewPanel from "./components/SourceReviewPanel.vue";
+import BrowserPanel from "./components/BrowserPanel.vue";
+import { openTab as openBrowserTab } from "./browserStore.js";
 
 const tabs = [
   { id: "demo", label: "Bemutató" },
   { id: "cases", label: "Ügyek" },
   { id: "search", label: "Keresési Futam" },
+  { id: "browser", label: "Böngésző" },
   { id: "archive", label: "Archivum" },
   { id: "audit", label: "Audit" },
   { id: "report", label: "Riport" },
@@ -546,6 +549,14 @@ const searchPlan = computed(() => {
   });
 
   return plans;
+});
+
+const browserPlanSuggestions = computed(() => {
+  const engine = selectedEngines.value[0] || "google";
+  return searchPlan.value.map((plan, index) => ({
+    title: `${index + 1}. ${plan.title.replace(/^\d+\.\s*/, "")}`,
+    url: buildExternalSearchUrl(engine, plan.query),
+  }));
 });
 
 const archiveInsights = computed(() => {
@@ -1715,18 +1726,46 @@ async function openSearchResult(result) {
   }
 }
 
-async function openResultInViewer(result) {
-  if (!currentCase.value) return;
+async function openInBrowserPanel({ url, title }) {
+  if (!currentCase.value) {
+    appError.value = "A böngésző használatához válassz aktív ügyet.";
+    return;
+  }
 
   try {
-    await api("open_viewer_window", {
-      caseId: currentCase.value.id,
-      url: result.url,
-      title: result.title,
-    });
+    await openBrowserTab({ caseId: currentCase.value.id, url, title });
+    currentTab.value = "browser";
   } catch (error) {
-    appError.value = `A találatnéző megnyitása sikertelen: ${String(error)}`;
+    appError.value = `A böngészőfül megnyitása sikertelen: ${String(error)}`;
   }
+}
+
+async function openResultInViewer(result) {
+  await openInBrowserPanel({ url: result.url, title: result.title });
+}
+
+async function openSearchPlanInBrowser() {
+  for (const item of browserPlanSuggestions.value) {
+    await openInBrowserPanel(item);
+  }
+}
+
+async function archiveBrowserTab(tab) {
+  if (!tab) return;
+  await archiveResult({
+    title: tab.title || tab.url,
+    url: tab.url,
+    original_url: "",
+    archived_url: "",
+    archive_kind: "live",
+    snapshot_timestamp: "",
+    snippet: "Beépített böngészőből archivált oldal.",
+    tier: 3,
+    source_type: "Böngésző",
+    relevance: 100,
+    query_used: rawQuery.value || "",
+  });
+  await loadSources();
 }
 
 function isSearchEngineUrl(url) {
@@ -2511,12 +2550,21 @@ function tierBadgeClass(tier) {
                 <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Javasolt keresési sorrend <HelpTooltip text="A rendszer itt lépésekre bontja a keresési stratégiát. Ez segít abban, hogy a kutatás ne egyetlen keresőkifejezésből álljon." /></div>
                 <div class="mt-1 text-xs text-slate-500">{{ searchPlan.length }} lépés</div>
               </div>
+                <div class="flex gap-2">
+                <button
+                  v-if="searchPlan.length"
+                  @click="openSearchPlanInBrowser"
+                  class="rounded-full border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100"
+                >
+                  Terv megnyitása a böngészőben
+                </button>
                 <button
                   @click="searchPlanExpanded = !searchPlanExpanded"
                   class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
                 >
                   {{ searchPlanExpanded ? "Elrejtés" : "Megnyitás" }}
                 </button>
+                </div>
               </div>
               <div v-if="searchPlanExpanded" class="mt-3 grid gap-3">
                 <article v-for="plan in searchPlan" :key="plan.title" class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
@@ -2760,7 +2808,7 @@ function tierBadgeClass(tier) {
                         @click="openResultInViewer(result)"
                         class="rounded-full border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400"
                       >
-                        Appon belül
+                        Böngészőben
                       </button>
                       <button
                         @click="archiveResult(result)"
@@ -2805,6 +2853,16 @@ function tierBadgeClass(tier) {
               </div>
             </div>
           </div>
+        </section>
+
+        <section v-else-if="currentTab === 'browser'" class="glass rounded-[28px] p-6">
+          <BrowserPanel
+            :case-id="currentCase?.id ?? null"
+            :suggestions="browserPlanSuggestions"
+            @open-url="openInBrowserPanel"
+            @archive="archiveBrowserTab"
+            @error="(message) => (appError = message)"
+          />
         </section>
 
         <section v-else-if="currentTab === 'archive'" class="glass rounded-[28px] p-6">
