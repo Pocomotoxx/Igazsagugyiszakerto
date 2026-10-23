@@ -7,15 +7,39 @@ import SourceReviewPanel from "./components/SourceReviewPanel.vue";
 import BrowserPanel from "./components/BrowserPanel.vue";
 import { openTab as openBrowserTab } from "./browserStore.js";
 
-const tabs = [
-  { id: "demo", label: "Bemutató" },
+const allTabs = [
+  { id: "demo", label: "Bemutató", advanced: true },
   { id: "cases", label: "Ügyek" },
   { id: "search", label: "Keresési Futam" },
   { id: "browser", label: "Böngésző" },
   { id: "archive", label: "Archivum" },
-  { id: "audit", label: "Audit" },
+  { id: "audit", label: "Audit", advanced: true },
   { id: "report", label: "Riport" },
 ];
+
+const UI_MODE_KEY = "irbr-ui-mode";
+function loadUiMode() {
+  try {
+    return localStorage.getItem(UI_MODE_KEY) === "advanced" ? "advanced" : "simple";
+  } catch {
+    return "simple";
+  }
+}
+const uiMode = ref(loadUiMode());
+const advanced = computed(() => uiMode.value === "advanced");
+const tabs = computed(() => allTabs.filter((tab) => advanced.value || !tab.advanced));
+
+function setUiMode(mode) {
+  uiMode.value = mode;
+  try {
+    localStorage.setItem(UI_MODE_KEY, mode);
+  } catch {
+    // a mód csak kényelmi beállítás, mentés nélkül is működik
+  }
+  if (mode === "simple" && allTabs.find((tab) => tab.id === currentTab.value)?.advanced) {
+    currentTab.value = "cases";
+  }
+}
 
 const engines = [
   { id: "google", label: "Google", note: "Széles recall, gyors első futam." },
@@ -1942,18 +1966,18 @@ function tierBadgeClass(tier) {
               <span class="h-1.5 w-1.5 rounded-full bg-sky-500"></span>
               Tauri-only kereséstámogató
             </div>
-            <h1 class="max-w-3xl text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">
+            <h1 :class="advanced ? 'text-3xl sm:text-4xl' : 'text-2xl'" class="max-w-3xl font-semibold tracking-tight text-slate-950">
               Igazságügyi szakértői keresésekhez épített kutatási munkaasztal.
             </h1>
-            <p class="mt-3 max-w-2xl text-sm leading-6 text-slate-600">
+            <p v-if="advanced" class="mt-3 max-w-2xl text-sm leading-6 text-slate-600">
               A rendszer nem színlel élő találatlistát. Keresési futamokat, forráspiramist, archiválható nyomvonalat és exportálható összefoglalót ad.
             </p>
-            <div class="mt-3">
+            <div v-if="advanced" class="mt-3">
               <HelpTooltip text="A kérdőjelek fölé húzva az egeret rövid magyarázat jelenik meg az adott funkcióról vagy blokkról." />
             </div>
           </div>
 
-          <div class="grid gap-3 sm:grid-cols-3 lg:min-w-[420px]">
+          <div v-if="advanced" class="grid gap-3 sm:grid-cols-3 lg:min-w-[420px]">
             <div class="rounded-2xl border border-white/70 bg-white/75 px-4 py-3 shadow-sm">
               <div class="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-500">Aktív ügyek <HelpTooltip text="Ennyi ügy van jelenleg a rendszerben. Az ügyek külön keresési és riport munkafolyamot kapnak." /></div>
               <div class="mt-2 text-2xl font-semibold text-slate-900">{{ cases.length }}</div>
@@ -1993,7 +2017,19 @@ function tierBadgeClass(tier) {
           {{ tab.label }}
         </button>
 
-        <div class="ml-auto flex min-w-[260px] items-center gap-2 rounded-full border border-white/70 bg-white/80 px-4 py-2">
+        <div class="ml-auto flex items-center rounded-full border border-white/70 bg-white/80 p-1" title="Egyszerű: csak a napi munka. Haladó: minden beállítás és az audit nézet.">
+          <button
+            v-for="mode in [{ id: 'simple', label: 'Egyszerű' }, { id: 'advanced', label: 'Haladó' }]"
+            :key="mode.id"
+            @click="setUiMode(mode.id)"
+            :class="[
+              'rounded-full px-3 py-1.5 text-xs font-semibold transition',
+              uiMode === mode.id ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100',
+            ]"
+          >{{ mode.label }}</button>
+        </div>
+
+        <div class="flex min-w-[260px] items-center gap-2 rounded-full border border-white/70 bg-white/80 px-4 py-2">
           <span class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Aktív ügy</span>
           <select
             v-model="currentCase"
@@ -2181,6 +2217,41 @@ function tierBadgeClass(tier) {
               </button>
             </div>
 
+            <div v-if="!advanced" class="mt-6 grid gap-3">
+              <label class="grid gap-1.5 text-sm">
+                <span class="font-semibold text-slate-700">Mit keresel?</span>
+                <input
+                  v-model="rawQuery"
+                  @keydown.enter="runSearch"
+                  placeholder="pl. háztartási munka óradíj Budapest"
+                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-400"
+                />
+              </label>
+              <p class="text-xs leading-5 text-slate-500">
+                Írd be a témát, vagy válassz fent egy gyorsindítót. A rendszer több keresőn és hivatalos forráson futtatja. A pontos kifejezések, forráscsomagok és AI/API beállítások a Haladó módban érhetők el.
+              </p>
+              <div class="flex flex-wrap items-center gap-3">
+                <button
+                  @click="runSearch"
+                  :disabled="isSearching || !constructedQuery"
+                  class="rounded-2xl bg-sky-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-sky-600/20 transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {{ isSearching ? "Keresés..." : "Keresés indítása" }}
+                </button>
+                <button
+                  v-if="searchPlan.length"
+                  @click="openSearchPlanInBrowser"
+                  class="rounded-2xl border border-sky-200 bg-sky-50 px-5 py-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-100"
+                >
+                  Megnyitás a böngészőben
+                </button>
+                <button @click="setUiMode('advanced')" class="text-xs font-semibold text-slate-500 underline-offset-2 hover:underline">
+                  Haladó beállítások…
+                </button>
+              </div>
+            </div>
+
+            <template v-if="advanced">
             <div class="mt-6 grid gap-4 md:grid-cols-2">
               <label class="grid gap-1.5 text-sm">
                 <span class="font-semibold text-slate-700">Kötelező kifejezések</span>
@@ -2619,6 +2690,7 @@ function tierBadgeClass(tier) {
                 </button>
               </div>
             </div>
+            </template>
           </div>
 
           <div class="glass rounded-[28px] p-6">
