@@ -18,7 +18,9 @@ use tauri::{Emitter, Manager};
 mod export;
 mod fetchx;
 mod history;
+mod platforms;
 mod provenance;
+mod rss;
 mod story;
 
 const MAX_SEARCH_QUERY_LEN: usize = 2000;
@@ -1652,6 +1654,276 @@ fn add_tavily_results(
     Ok(count)
 }
 
+enum SiteProvider<'a> {
+    Tavily(&'a str),
+    Brave(&'a str),
+    Cse(&'a str, &'a str),
+}
+
+/// Melyik valódi webes keresőszolgáltatás fut a platformonkénti keresésekhez: egy hívás
+/// platformonként, a kvóta védelmében csak az első beállított szolgáltatóval.
+fn pick_site_provider(settings: &AppSettings, include_cse: bool) -> Option<SiteProvider<'_>> {
+    if !include_cse {
+        return None;
+    }
+    if !settings.tavily_key.trim().is_empty() {
+        return Some(SiteProvider::Tavily(settings.tavily_key.trim()));
+    }
+    if !settings.brave_key.trim().is_empty() {
+        return Some(SiteProvider::Brave(settings.brave_key.trim()));
+    }
+    if !settings.google_cse_key.trim().is_empty() && !settings.google_cse_cx.trim().is_empty() {
+        return Some(SiteProvider::Cse(
+            settings.google_cse_key.trim(),
+            settings.google_cse_cx.trim(),
+        ));
+    }
+    None
+}
+
+fn run_site_search(
+    provider: &SiteProvider<'_>,
+    platform: &platforms::Platform,
+    parsed: &platforms::ParsedQuery,
+) -> Result<Vec<SearchResult>, String> {
+    let query = platforms::site_api_query(platform, parsed);
+    let mut local = Vec::new();
+    match provider {
+        SiteProvider::Tavily(key) => add_tavily_results(&mut local, &query, key)?,
+        SiteProvider::Brave(key) => add_brave_results(&mut local, &query, key)?,
+        SiteProvider::Cse(key, cx) => add_cse_results(&mut local, &query, key, cx)?,
+    };
+    for (index, result) in local.iter_mut().enumerate() {
+        result.source_type = platform.label.to_string();
+        result.tier = platform.tier;
+        result.relevance = (platform.relevance - (index as i32) * 2).max(55);
+    }
+    Ok(local)
+}
+
+fn add_rss_results(
+    results: &mut Vec<SearchResult>,
+    parsed: &platforms::ParsedQuery,
+) -> Result<(usize, Vec<String>), String> {
+    let outcome = rss::search(parsed)?;
+    let count = outcome.items.len();
+    for (index, item) in outcome.items.into_iter().enumerate() {
+        push_detected_result(
+            results,
+            0,
+            &item.title,
+            item.link.clone(),
+            if item.summary.is_empty() {
+                format!("Hír a(z) {} csatornából.", item.feed)
+            } else {
+                item.summary.clone()
+            },
+            3,
+            "Hírforrás (RSS)",
+            (86 - (index as i32)).max(55),
+            parsed.plain(),
+            "Megnyitás",
+        );
+        if let Some(last) = results.last_mut() {
+            last.source_type = format!("Hírforrás: {}", item.feed);
+            last.published_at = item.published_at.clone();
+        }
+    }
+    Ok((count, outcome.errors))
+}
+
+type PlatformOutcome = (String, Result<Vec<SearchResult>, String>);
+
+/// A bekapcsolt site- és RSS-platformok lekérése párhuzamosan. Visszaadja a találatokat
+/// platformonként és a forrás-állapot sorokat.
+fn run_platform_searches(
+    settings: &AppSettings,
+    include_cse: bool,
+    parsed: &platforms::ParsedQuery,
+    enabled_ids: &[String],
+) -> (Vec<PlatformOutcome>, Vec<ProviderHealth>) {
+    if !parsed.has_terms() {
+        return (Vec::new(), Vec::new());
+    }
+    let provider = pick_site_provider(settings, include_cse);
+    let active: Vec<&platforms::Platform> = platforms::PLATFORMS
+        .iter()
+        .filter(|p| platforms::enabled(enabled_ids, p.id))
+        .filter(|p| p.kind == platforms::Kind::Site || p.kind == platforms::Kind::Rss)
+        .collect();
+
+    type Found = Result<(Vec<SearchResult>, String), String>;
+    let timed: Vec<(&platforms::Platform, Option<Found>, i64)> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = active
+                .iter()
+                .map(|platform| {
+                    let provider = &provider;
+                    scope.spawn(move || {
+                        let started = Instant::now();
+                        let outcome = match platform.kind {
+                            platforms::Kind::Rss => {
+                                let mut local = Vec::new();
+                                add_rss_results(&mut local, parsed).map(|(_, errors)| {
+                                    let note = if errors.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("{} csatorna nem volt elérhető: {}", errors.len(), errors.join("; "))
+                                    };
+                                    (local, note)
+                                })
+                            }
+                            _ => match provider {
+                                Some(provider) => run_site_search(provider, platform, parsed)
+                                    .map(|found| (found, String::new())),
+                                None => return (*platform, None, 0),
+                            },
+                        };
+                        (*platform, Some(outcome), started.elapsed().as_millis() as i64)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .zip(active.iter())
+                .map(|(handle, platform)| {
+                    handle.join().unwrap_or((
+                        *platform,
+                        Some(Err("belső hiba".to_string())),
+                        0,
+                    ))
+                })
+                .collect()
+        });
+
+    let mut outcomes = Vec::new();
+    let mut health = Vec::new();
+    for (platform, outcome, ms) in timed {
+        match outcome {
+            None => health.push(ProviderHealth {
+                id: platform.id.into(),
+                label: platform.label.into(),
+                state: "kikapcsolva".into(),
+                count: 0,
+                ms,
+                error: "Nincs beállított webes keresőszolgáltatás (Tavily, Brave vagy Google CSE).".into(),
+            }),
+            Some(Ok((found, note))) => {
+                health.push(ProviderHealth {
+                    id: platform.id.into(),
+                    label: platform.label.into(),
+                    state: "ok".into(),
+                    count: found.len() as i32,
+                    ms,
+                    error: note,
+                });
+                outcomes.push((platform.label.to_string(), Ok(found)));
+            }
+            Some(Err(error)) => {
+                health.push(ProviderHealth {
+                    id: platform.id.into(),
+                    label: platform.label.into(),
+                    state: "hiba".into(),
+                    count: 0,
+                    ms,
+                    error: error.clone(),
+                });
+                outcomes.push((platform.label.to_string(), Err(error)));
+            }
+        }
+    }
+    (outcomes, health)
+}
+
+/// Keresőkártyák minden bekapcsolt platformra, a platform szintaxisához igazított lekérdezéssel.
+fn add_platform_cards(
+    results: &mut Vec<SearchResult>,
+    original: &str,
+    parsed: &platforms::ParsedQuery,
+    enabled_ids: &[String],
+) {
+    for platform in platforms::PLATFORMS {
+        if !platforms::enabled(enabled_ids, platform.id) || platform.kind == platforms::Kind::Rss {
+            continue;
+        }
+        // a Google kártyáit az add_engine_launchers adja (variánsokkal együtt)
+        if platform.id == "google" {
+            continue;
+        }
+        if let Some(url) = platforms::native_url(platform.native, original, parsed) {
+            push_detected_result(
+                results,
+                0,
+                &format!("{} keresés", platform.label),
+                url,
+                format!(
+                    "A kérés a(z) {} saját szintaxisára igazítva. Lekérdezés: {}",
+                    platform.label,
+                    if platform.kind == platforms::Kind::Site {
+                        platforms::site_api_query(platform, parsed)
+                    } else {
+                        parsed.with_operators()
+                    }
+                ),
+                platform.tier,
+                platform.source_type,
+                platform.relevance - 10,
+                original.to_string(),
+                "Megnyitás",
+            );
+        }
+        if platform.kind == platforms::Kind::Site && platform.native == platforms::Native::None
+            || platform.kind == platforms::Kind::Site && platform.id != "facebook" && platform.id != "reddit"
+        {
+            push_detected_result(
+                results,
+                0,
+                &format!("{} – Google (site:) keresés", platform.label),
+                platforms::google_site_url(platform, parsed),
+                format!(
+                    "Domainre szűkített Google-keresés ugyanarra a kérdésre. Domain: {}.",
+                    platform.domains.join(", ")
+                ),
+                platform.tier,
+                platform.source_type,
+                platform.relevance - 12,
+                original.to_string(),
+                "Megnyitás",
+            );
+        }
+    }
+}
+
+#[tauri::command]
+fn platform_links(query: String, enabled_platforms: Option<Vec<String>>) -> Vec<platforms::PlatformLink> {
+    platforms::links(query.trim(), &enabled_platforms.unwrap_or_default())
+}
+
+#[derive(Serialize)]
+struct PlatformInfo {
+    id: &'static str,
+    label: &'static str,
+    kind: &'static str,
+    domains: Vec<&'static str>,
+}
+
+#[tauri::command]
+fn list_platforms() -> Vec<PlatformInfo> {
+    platforms::PLATFORMS
+        .iter()
+        .map(|p| PlatformInfo {
+            id: p.id,
+            label: p.label,
+            kind: match p.kind {
+                platforms::Kind::Engine => "kereső",
+                platforms::Kind::Site => "domain",
+                platforms::Kind::Rss => "RSS",
+            },
+            domains: p.domains.to_vec(),
+        })
+        .collect()
+}
+
 fn pack_allowed(selected_source_packs: &[String], pack: &str) -> bool {
     selected_source_packs.is_empty()
         || selected_source_packs
@@ -1708,58 +1980,9 @@ fn add_curated_sources(
     query: &str,
     selected_source_packs: &[String],
 ) {
+    // A hivatalos, közösségi és tudományos források a platformokban (platforms.rs) élnek;
+    // itt csak a kiegészítő, platformként nem kezelt kontrollforrások maradtak.
     let official_sources = vec![
-        (
-            "official",
-            "Nemzeti Jogszabálytár célzott keresés",
-            format!("https://njt.hu/"),
-            "Nyissa meg a jogszabálytárat, és futtassa le a lekérdezést a kulcsfogalmakra. Jogalap, definíció és hatály ellenőrzésére való.",
-            1,
-            "Hivatalos forrás",
-            95,
-        ),
-        (
-            "official",
-            "Magyar Közlöny célzott keresés",
-            format!("https://magyarkozlony.hu/"),
-            "Rendeletek, módosítások és végrehajtási szabályok ellenőrzésére. Különösen hasznos, ha a kérdés időponthoz vagy hatálybalépéshez kötött.",
-            1,
-            "Hivatalos forrás",
-            93,
-        ),
-        (
-            "official",
-            "KSH célzott keresés",
-            format!("https://www.ksh.hu/"),
-            "Statisztikai háttér, árszint, munkaerőpiaci vagy ágazati adatok validálására.",
-            1,
-            "Statisztikai forrás",
-            90,
-        ),
-        (
-            "official",
-            "Közbeszerzési Értesítő célzott keresés",
-            format!(
-                "https://www.google.com/search?q={}",
-                url_encode(&format!("{query} site:kozbeszerzes.hu"))
-            ),
-            "Közbeszerzési hirdetmények, szerződéses összegek, beszerzési tárgyak és nyertes ajánlatok összevetésére. Különösen hasznos ár- és piaci kontrollnál.",
-            1,
-            "Hivatalos beszerzési forrás",
-            89,
-        ),
-        (
-            "science",
-            "Google Scholar / tudományos keresés",
-            format!(
-                "https://scholar.google.com/scholar?q={}",
-                url_encode(query)
-            ),
-            "Szakirodalmi alátámasztás, módszertani cikkek és hivatkozható publikációk keresésére.",
-            2,
-            "Tudományos forrás",
-            82,
-        ),
         (
             "shared",
             "Google Drive / dokumentummegosztók",
@@ -1795,30 +2018,6 @@ fn add_curated_sources(
             4,
             "Piaci kontroll",
             52,
-        ),
-        (
-            "reddit",
-            "Reddit kontrollkeresés",
-            format!(
-                "https://www.google.com/search?q={}",
-                url_encode(&format!("{query} site:reddit.com"))
-            ),
-            "Gyakorlati tapasztalatok, felhasználói beszámolók és közösségi kontrollpontok keresésére. Önálló bizonyítékként nem, csak háttéranyagként vagy kontrollforrásként kezelendő.",
-            4,
-            "Közösségi kontroll",
-            48,
-        ),
-        (
-            "facebook_groups",
-            "Facebook csoport kontrollkeresés",
-            format!(
-                "https://www.google.com/search?q={}",
-                url_encode(&format!("{query} (site:facebook.com/groups OR site:facebook.com)"))
-            ),
-            "Google altal indexelt Facebook csoportok, oldalak es nyilvanos kozossegi talalatok felkutatasara. Korlatozott bizonyito ereju kontrollforras.",
-            4,
-            "Közösségi kontroll",
-            44,
         ),
     ];
 
@@ -2628,10 +2827,12 @@ async fn execute_search(
     search_mode: String,
     include_cse: Option<bool>,
     selected_source_packs: Option<Vec<String>>,
+    enabled_platforms: Option<Vec<String>>,
 ) -> Result<SearchRunOutput, String> {
     let db_path = state.db_path.clone();
     let include_cse = include_cse.unwrap_or(true);
     let selected_source_packs = selected_source_packs.unwrap_or_default();
+    let enabled_platforms = enabled_platforms.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         execute_search_blocking(
             &db_path,
@@ -2642,6 +2843,7 @@ async fn execute_search(
             &search_mode,
             include_cse,
             &selected_source_packs,
+            &enabled_platforms,
         )
     })
     .await
@@ -2657,6 +2859,7 @@ fn execute_search_blocking(
     search_mode: &str,
     include_cse: bool,
     selected_source_packs: &[String],
+    enabled_platforms: &[String],
 ) -> Result<SearchRunOutput, String> {
     let trimmed = search_query.trim();
     if trimmed.is_empty() {
@@ -2705,7 +2908,12 @@ fn execute_search_blocking(
 
     if effective_mode != "ai_only" {
         let constructed_start = results.len();
-        add_engine_launchers(&mut results, 0, engine, trimmed);
+        let _ = engine; // a platformok kiválasztása a beállításokban van, nem keresésenként
+        let parsed_query = platforms::parse_query(trimmed);
+        if platforms::enabled(enabled_platforms, "google") {
+            add_engine_launchers(&mut results, 0, "google", trimmed);
+        }
+        add_platform_cards(&mut results, trimmed, &parsed_query, enabled_platforms);
         add_curated_sources(&mut results, 0, trimmed, selected_source_packs);
         add_domain_specific_sources(&mut results, 0, trimmed, selected_source_packs);
         tag_evidence(&mut results, constructed_start, "CONSTRUCTED");
@@ -2820,6 +3028,31 @@ fn execute_search_blocking(
             "cse", "Google CSE", cse_configured, include_cse,
             &cse_error, results.len() - n_cse, t_cse,
         ));
+
+        // Platformonkénti, a platformhoz igazított lekérdezések (párhuzamosan).
+        let (platform_results, platform_health) = run_platform_searches(
+            &settings,
+            include_cse,
+            &parsed_query,
+            enabled_platforms,
+        );
+        for (platform, outcome) in &platform_results {
+            if let Err(error) = outcome {
+                let _ = log_action(
+                    db_path,
+                    case_id,
+                    "platform_search_error",
+                    trimmed,
+                    &format!("{} keresése nem futott le: {}", platform, redact_secrets(error, &settings)),
+                );
+            }
+        }
+        for (_, outcome) in platform_results {
+            if let Ok(found) = outcome {
+                results.extend(found);
+            }
+        }
+        health.extend(platform_health);
         tag_evidence(&mut results, retrieved_start, "RETRIEVED");
     }
 
@@ -3746,6 +3979,8 @@ pub fn run() {
             browser_close_tab,
             fetch_page_text,
             search_history,
+            platform_links,
+            list_platforms,
             inspect_source,
             export_sources,
             compare_search_runs,
@@ -3957,6 +4192,55 @@ mod tests {
         assert!(table_has_column(&conn, "search_runs", "health").unwrap());
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM run_results", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn platform_cards_cover_every_enabled_platform_with_adapted_queries() {
+        let mut results = Vec::new();
+        let original = "szakértői óradíj 2020..2022";
+        let parsed = platforms::parse_query(original);
+        add_platform_cards(&mut results, original, &parsed, &[]);
+        let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert!(urls.iter().any(|u| u.contains("facebook.com/search/posts")));
+        assert!(urls.iter().any(|u| u.contains("reddit.com/search")));
+        assert!(urls.iter().any(|u| u.contains("x.com/search") && u.contains("since%3A2020")));
+        assert!(urls.iter().any(|u| u.contains("as_ylo=2020")));
+        assert!(urls.iter().any(|u| u.contains("google.com/search") && u.contains("magyarkozlony.hu")));
+        assert!(urls.iter().any(|u| u.contains("njt.hu")));
+
+        let mut only_fb = Vec::new();
+        add_platform_cards(&mut only_fb, original, &parsed, &["facebook".to_string()]);
+        assert_eq!(only_fb.len(), 1);
+        assert!(only_fb[0].url.contains("facebook.com"));
+    }
+
+    #[test]
+    fn platform_searches_report_missing_provider_and_skip_empty_queries() {
+        let settings = default_app_settings();
+        let parsed = platforms::parse_query("óradíj");
+        let (outcomes, health) =
+            run_platform_searches(&settings, true, &parsed, &["facebook".to_string(), "magyar_kozlony".to_string()]);
+        assert!(outcomes.is_empty());
+        assert_eq!(health.len(), 2);
+        assert!(health.iter().all(|h| h.state == "kikapcsolva"));
+
+        let empty = platforms::parse_query("site:ksh.hu 2020..2022");
+        let (o, h) = run_platform_searches(&settings, true, &empty, &[]);
+        assert!(o.is_empty() && h.is_empty());
+    }
+
+    #[test]
+    fn site_provider_priority_is_tavily_then_brave_then_cse() {
+        let mut settings = default_app_settings();
+        assert!(pick_site_provider(&settings, true).is_none());
+        settings.google_cse_key = "k".into();
+        settings.google_cse_cx = "cx".into();
+        assert!(matches!(pick_site_provider(&settings, true), Some(SiteProvider::Cse(_, _))));
+        settings.brave_key = "b".into();
+        assert!(matches!(pick_site_provider(&settings, true), Some(SiteProvider::Brave(_))));
+        settings.tavily_key = "t".into();
+        assert!(matches!(pick_site_provider(&settings, true), Some(SiteProvider::Tavily(_))));
+        assert!(pick_site_provider(&settings, false).is_none());
     }
 
     #[test]

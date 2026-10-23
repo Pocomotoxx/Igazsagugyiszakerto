@@ -322,3 +322,11 @@ Szabály:
 - Új modulok: `provenance`, `story`, `export`, `history`, `fetchx` (mind egységtesztelt).
 - Új parancsok: `search_history`, `inspect_source`, `export_sources`, `compare_search_runs`, `previous_run_delta`, `get_source_health`, `cluster_stories`.
 - Felület: Előzmények fül (Haladó mód), frissességi és történet-jelvények a találatokon, futam-különbség sáv, forrás-állapot chipek.
+
+
+### M-Platformok - egy kérés minden platformon
+- A keresőmotor- és forráscsomag-választás kikerült a keresési űrlapból; a kérés minden bekapcsolt platformon lefut.
+- Új modulok: `platforms` (lekérdezés-elemzés és platformonkénti igazítás), `rss` (10 magyar hírcsatorna lekérése és szűrése).
+- Új parancsok: `list_platforms`, `platform_links`; az `execute_search` kapott `enabled_platforms` paramétert.
+- Platformonkénti forrás-állapot sorok a mátrixban.
+

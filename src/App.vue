@@ -122,6 +122,50 @@ const appError = ref("");
 const searchWarning = ref("");
 const searchDiagnostics = ref(null);
 const runDelta = ref(null);
+
+const PLATFORMS_KEY = "irbr-platforms";
+const platformList = ref([]);
+const platformLinks = ref([]);
+function loadEnabledPlatforms() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PLATFORMS_KEY) || "[]");
+    return Array.isArray(raw) ? raw.filter((id) => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+// üres lista = minden platform bekapcsolva
+const enabledPlatforms = ref(loadEnabledPlatforms());
+const isPlatformEnabled = (id) => enabledPlatforms.value.length === 0 || enabledPlatforms.value.includes(id);
+const activePlatformCount = computed(() => platformList.value.filter((p) => isPlatformEnabled(p.id)).length);
+const platformQuery = (id) => platformLinks.value.find((link) => link.id === id)?.query || "";
+
+function togglePlatform(id) {
+  const all = platformList.value.map((p) => p.id);
+  let current = enabledPlatforms.value.length === 0 ? [...all] : [...enabledPlatforms.value];
+  current = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
+  if (current.length === 0) return; // legalább egy platform maradjon bekapcsolva
+  enabledPlatforms.value = current.length === all.length ? [] : current;
+  try {
+    localStorage.setItem(PLATFORMS_KEY, JSON.stringify(enabledPlatforms.value));
+  } catch {
+    // a beállítás csak kényelmi, mentés nélkül is működik
+  }
+}
+
+let platformLinksTimer = null;
+async function refreshPlatformLinks() {
+  const query = broadQuery.value.trim();
+  if (!query) {
+    platformLinks.value = [];
+    return;
+  }
+  try {
+    platformLinks.value = await api("platform_links", { query, enabledPlatforms: enabledPlatforms.value });
+  } catch {
+    platformLinks.value = [];
+  }
+}
 const searchHealth = ref([]);
 const expandedStories = ref({});
 
@@ -456,6 +500,11 @@ function buildFallbackSearchResults(query) {
 onMounted(async () => {
   try {
     await api("init_db");
+    try {
+      platformList.value = await api("list_platforms");
+    } catch {
+      platformList.value = [];
+    }
     await loadAppSettings();
     await loadCases();
   } catch (error) {
@@ -528,6 +577,11 @@ const broadQuery = computed(() => {
 });
 
 const constructedQuery = computed(() => broadQuery.value);
+
+watch([broadQuery, enabledPlatforms], () => {
+  clearTimeout(platformLinksTimer);
+  platformLinksTimer = setTimeout(refreshPlatformLinks, 300);
+});
 
 const sourcePackLabels = {
   official: "Hivatalos források",
@@ -637,13 +691,9 @@ const searchPlan = computed(() => {
   return plans;
 });
 
-const browserPlanSuggestions = computed(() => {
-  const engine = selectedEngines.value[0] || "google";
-  return searchPlan.value.map((plan, index) => ({
-    title: `${index + 1}. ${plan.title.replace(/^\d+\.\s*/, "")}`,
-    url: buildExternalSearchUrl(engine, plan.query),
-  }));
-});
+const browserPlanSuggestions = computed(() =>
+  platformLinks.value.map((link) => ({ title: link.label, url: link.url })),
+);
 
 const archiveInsights = computed(() => {
   const tierCounts = { 1: 0, 2: 0, 3: 0, 4: 0 };
@@ -1639,6 +1689,12 @@ function toggleEngine(engineId) {
 }
 
 function buildQuerySet() {
+  // Minden kérés minden bekapcsolt platformon lefut; a platformonkénti igazítást a backend végzi.
+  const base = broadQuery.value.trim();
+  return base ? [base] : [];
+}
+
+function buildQuerySetLegacy() {
   const broad = broadQuery.value.trim();
   const filtered = filteredQueries.value.map((item) => item.query);
   const hasPackScope = !searchTerms.value.site.trim() && selectedSourcePackKeys.value.length > 0;
@@ -1688,21 +1744,18 @@ async function runSearch() {
     const calls = [];
 
     if (searchMode.value !== "ai_only") {
-      selectedEngines.value.forEach((engine, engineIndex) => {
-        querySet.forEach((query) => {
-          calls.push(
-            api("execute_search", {
-              caseId: currentCase.value.id,
-              searchQuery: query,
-              tierFilter: selectedTierFilter.value,
-              engine,
-              searchMode: "native",
-              includeCse: engineIndex === 0,
-              selectedSourcePacks: selectedSourcePackKeys.value,
-            }),
-          );
-        });
-      });
+      calls.push(
+        api("execute_search", {
+          caseId: currentCase.value.id,
+          searchQuery: primaryQuery,
+          tierFilter: selectedTierFilter.value,
+          engine: "google",
+          searchMode: "native",
+          includeCse: true,
+          selectedSourcePacks: [],
+          enabledPlatforms: enabledPlatforms.value,
+        }),
+      );
     }
 
     if (searchMode.value !== "native") {
@@ -1711,10 +1764,11 @@ async function runSearch() {
           caseId: currentCase.value.id,
           searchQuery: primaryQuery,
           tierFilter: selectedTierFilter.value,
-          engine: selectedEngines.value[0] || "google",
+          engine: "google",
           searchMode: "ai_only",
           includeCse: false,
-          selectedSourcePacks: selectedSourcePackKeys.value,
+          selectedSourcePacks: [],
+          enabledPlatforms: enabledPlatforms.value,
         }),
       );
     }
@@ -1803,15 +1857,15 @@ async function runSearch() {
     lastSearchSummary.value =
       `Mód: ${searchModes.find((item) => item.id === searchMode.value)?.label || searchMode.value}. ` +
       `${searchMode.value === "native" ? `Natív futam: ${nativeRunModes.find((item) => item.id === nativeRunMode.value)?.label || nativeRunMode.value}. ` : ""}` +
-      `Elsődleges lekérdezés: ${primaryQuery}. Motorok: ${selectedEngines.value.join(", ")}. ` +
-      `Találatok: ${searchResults.value.length}. Keresési terv-lépések: ${searchPlan.value.length}.`;
+      `Elsődleges lekérdezés: ${primaryQuery}. Platformok: ${activePlatformCount.value}. ` +
+      `Találatok: ${searchResults.value.length}. Keresési terv-lépések: ${platformLinks.value.length}.`;
     activeSearchRunId.value = await api("record_search_run", {
       caseId: currentCase.value.id,
       summary: lastSearchSummary.value,
       baseQuery: querySet.join(" || "),
-      engine: `${searchMode.value} | ${selectedEngines.value.join(", ")} | ${aiSettings.value.ai_provider}`,
+      engine: `${searchMode.value} | ${enabledPlatforms.value.length ? enabledPlatforms.value.join(", ") : "minden platform"} | ${aiSettings.value.ai_provider}`,
       tierFilter: selectedTierFilter.value,
-      planCount: searchPlan.value.length,
+      planCount: platformLinks.value.length,
       resultCount: searchResults.value.length,
       results: searchResults.value.map((item) => ({
         url: item.url,
@@ -2357,7 +2411,7 @@ function tierBadgeClass(tier) {
                   {{ isSearching ? "Keresés..." : "Keresés indítása" }}
                 </button>
                 <button
-                  v-if="searchPlan.length"
+                  v-if="platformLinks.length"
                   @click="openSearchPlanInBrowser"
                   class="rounded-2xl border border-sky-200 bg-sky-50 px-5 py-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-100"
                 >
@@ -2412,39 +2466,7 @@ function tierBadgeClass(tier) {
               <textarea v-model="rawQuery" rows="4" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 font-mono text-sm outline-none transition focus:border-slate-400"></textarea>
             </label>
 
-            <div class="mt-5 grid gap-4 lg:grid-cols-[1fr_auto]">
-              <div>
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Forráscsomagok</div>
-                <p class="mt-2 text-xs leading-5 text-slate-500">
-                  Csak az itt bepipált forráscsomagok oldalain fut a natív és a valódi webes keresés. Aktív hatókör: {{ selectedSourcePackSummary }}
-                </p>
-                <div class="mt-3 flex flex-wrap gap-2">
-                  <label
-                    v-for="(enabled, key) in sourcePacks"
-                    :key="key"
-                    class="inline-flex max-w-full items-start gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700"
-                  >
-                    <input v-model="sourcePacks[key]" type="checkbox" class="mt-0.5 accent-slate-900" />
-                    <span class="grid gap-1">
-                      <span>{{ sourcePackMeta[key]?.label || key }}</span>
-                      <span class="text-[11px] font-normal leading-4 text-slate-500">
-                        {{ sourcePackMeta[key]?.info }}
-                      </span>
-                    </span>
-                  </label>
-                </div>
-              </div>
-
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Kutatási lencse</span>
-                <select v-model="researchLens" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none">
-                  <option value="balanced">Kiegyensúlyozott</option>
-                  <option value="pricing">Ár / óradíj fókusz</option>
-                  <option value="legal">Jogi / módszertani fókusz</option>
-                  <option value="operations">Költség / üzemeltetés fókusz</option>
-                </select>
-              </label>
-
+            <div class="mt-5 grid gap-4">
               <div class="grid gap-3">
                 <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Keresési mód</div>
                 <div class="grid gap-3">
@@ -2465,28 +2487,6 @@ function tierBadgeClass(tier) {
                     </span>
                   </label>
                 </div>
-              </div>
-            </div>
-
-            <div v-if="searchMode === 'native'" class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Natív futtatási profil</div>
-              <div class="mt-3 grid gap-3 lg:grid-cols-3">
-                <label
-                  v-for="mode in nativeRunModes"
-                  :key="mode.id"
-                  :class="[
-                    'grid gap-1 rounded-2xl border px-4 py-3 transition',
-                    nativeRunMode === mode.id ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700',
-                  ]"
-                >
-                  <div class="flex items-center gap-3">
-                    <input v-model="nativeRunMode" type="radio" :value="mode.id" class="accent-slate-900" />
-                    <span class="text-sm font-semibold">{{ mode.label }}</span>
-                  </div>
-                  <span :class="nativeRunMode === mode.id ? 'text-slate-300' : 'text-slate-500'" class="text-xs leading-5">
-                    {{ mode.note }}
-                  </span>
-                </label>
               </div>
             </div>
 
@@ -2735,61 +2735,46 @@ function tierBadgeClass(tier) {
 
             <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
               <div class="flex items-center justify-between gap-3">
-              <div>
-                <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Javasolt keresési sorrend <HelpTooltip text="A rendszer itt lépésekre bontja a keresési stratégiát. Ez segít abban, hogy a kutatás ne egyetlen keresőkifejezésből álljon." /></div>
-                <div class="mt-1 text-xs text-slate-500">{{ searchPlan.length }} lépés</div>
-              </div>
+                <div>
+                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Platformok <HelpTooltip text="Minden keresés minden bekapcsolt platformon lefut, a platform saját szintaxisára igazított lekérdezéssel. Itt kapcsolhatsz ki platformot." /></div>
+                  <div class="mt-1 text-xs text-slate-500">{{ activePlatformCount }} / {{ platformList.length }} bekapcsolva. A valódi webes platformok keresésenként egy-egy API-hívást használnak.</div>
+                </div>
                 <div class="flex gap-2">
-                <button
-                  v-if="searchPlan.length"
-                  @click="openSearchPlanInBrowser"
-                  class="rounded-full border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100"
-                >
-                  Terv megnyitása a böngészőben
-                </button>
-                <button
-                  @click="searchPlanExpanded = !searchPlanExpanded"
-                  class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  {{ searchPlanExpanded ? "Elrejtés" : "Megnyitás" }}
-                </button>
+                  <button
+                    v-if="platformLinks.length"
+                    @click="openSearchPlanInBrowser"
+                    class="rounded-full border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100"
+                  >
+                    Megnyitás a böngészőben
+                  </button>
+                  <button
+                    @click="searchPlanExpanded = !searchPlanExpanded"
+                    class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
+                  >
+                    {{ searchPlanExpanded ? "Elrejtés" : "Beállítás" }}
+                  </button>
                 </div>
               </div>
-              <div v-if="searchPlanExpanded" class="mt-3 grid gap-3">
-                <article v-for="plan in searchPlan" :key="plan.title" class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                  <div class="text-sm font-semibold text-slate-900">{{ plan.title }}</div>
-                  <p class="mt-1 text-xs leading-5 text-slate-600">{{ plan.note }}</p>
-                  <p class="mt-2 break-words font-mono text-[11px] leading-5 text-slate-500">{{ plan.query }}</p>
-                </article>
+              <div v-if="searchPlanExpanded" class="mt-3 grid gap-2">
+                <label
+                  v-for="platform in platformList"
+                  :key="platform.id"
+                  class="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2.5"
+                >
+                  <input type="checkbox" class="mt-1 accent-slate-900" :checked="isPlatformEnabled(platform.id)" @change="togglePlatform(platform.id)" />
+                  <span class="min-w-0">
+                    <span class="text-sm font-semibold text-slate-900">{{ platform.label }}</span>
+                    <span class="ml-2 text-[11px] uppercase tracking-[0.12em] text-slate-500">{{ platform.kind }}</span>
+                    <span v-if="platformQuery(platform.id)" class="mt-1 block break-words font-mono text-[11px] leading-5 text-slate-500">{{ platformQuery(platform.id) }}</span>
+                  </span>
+                </label>
               </div>
               <div v-else class="mt-3 text-xs text-slate-500">
-                A részletes keresési sorrend össze van csukva. Nyisd meg, ha a teljes tervet látni akarod.
+                Minden platform be van kapcsolva, hacsak itt másképp nem állítod. A lekérdezés mindenhol a platform saját szintaxisára alakul.
               </div>
             </div>
 
             <div class="mt-5 grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
-              <div>
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Keresőmotorok</div>
-                <div class="mt-3 grid gap-3">
-                  <button
-                    v-for="engine in engines"
-                    :key="engine.id"
-                    @click="toggleEngine(engine.id)"
-                    :class="[
-                      'rounded-2xl border px-4 py-3 text-left transition',
-                      selectedEngines.includes(engine.id)
-                        ? 'border-slate-900 bg-slate-900 text-white'
-                        : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300',
-                    ]"
-                  >
-                    <div class="text-sm font-semibold">{{ engine.label }}</div>
-                    <div :class="selectedEngines.includes(engine.id) ? 'text-slate-300' : 'text-slate-500'" class="mt-1 text-xs">
-                      {{ engine.note }}
-                    </div>
-                  </button>
-                </div>
-              </div>
-
               <div class="grid gap-3">
                 <label class="grid gap-1.5 text-sm">
                   <span class="font-semibold text-slate-700">Tier szűrő</span>

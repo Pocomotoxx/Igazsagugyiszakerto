@@ -66,3 +66,19 @@ A korábbi Python/pywebview előtanulmány kivezetésre került. A támogatott r
 - **Korlátos lekérés:** átmeneti hibánál (időtúllépés, 408/429/5xx) legfeljebb két újrapróbálás, a `Retry-After` tiszteletben tartásával; a méretkorlát miatt csonka letöltés jelölve van. Az AI-válasz sémaellenőrzött, hibás válasznál szabályalapú tartalék készül.
 
 Az ötletek a Crucix (AGPL-3.0) nyílt forráskódú projektből származnak; kód nem került átvételre, a megoldások önállóan, Rustban készültek.
+
+## Platformok: egy kérés, minden platformon
+
+A keresés nem keresőmotor-választással működik. Minden kérés minden bekapcsolt platformon lefut, és mindenhol a platform saját szintaxisára igazodik:
+
+| Platform | Mit csinál |
+|---|---|
+| Google, Bing, DuckDuckGo | keresőkártya a platform operátoraival (Bingnél és DuckDuckGónál évhatár nélkül) |
+| Google Scholar | évszűrő a `as_ylo`/`as_yhi` paraméterekkel |
+| X (Twitter) | az évhatár `since:`/`until:` dátumhatárrá alakul |
+| YouTube | operátormentes keresőszöveg |
+| Facebook, Reddit | valódi webes keresés a domainre szűkítve + a platform saját keresője (operátormentesen) |
+| Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bírósági határozatok, Közbeszerzési Értesítő | valódi webes keresés a hivatalos domain(ek)re szűkítve + domainre szűkített Google-kártya |
+| Magyar hírcsatornák (RSS) | 10 hírcsatorna közvetlen lekérése és szűrése a kifejezésre (ékezetfüggetlen, évtartománnyal), a csatorna saját közzétételi idejével |
+
+A domainre szűkített valódi keresés platformonként egy hívás az első beállított szolgáltatóval (Tavily, ennek hiányában Brave, majd Google CSE). Ha egyik sincs beállítva, a platformokhoz keresőkártya készül, a forrás-állapot mátrixban pedig „kikapcsolva” szerepel. A platformok a Haladó módban, a keresési panel „Platformok” kártyáján kapcsolhatók ki; a választás megmarad.
