@@ -3652,6 +3652,11 @@ fn previous_run_delta(
 }
 
 #[tauri::command]
+fn cluster_stories(texts: Vec<String>) -> Vec<usize> {
+    story::cluster(&texts)
+}
+
+#[tauri::command]
 fn get_source_health(
     state: tauri::State<'_, DbState>,
     case_id: i64,
@@ -3746,6 +3751,7 @@ pub fn run() {
             compare_search_runs,
             previous_run_delta,
             get_source_health,
+            cluster_stories,
             save_report
         ])
         .run(tauri::generate_context!())

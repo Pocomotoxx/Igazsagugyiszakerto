@@ -316,3 +316,9 @@ Szabály:
 - a forráscsomagok már nem csak javasolt plusz futamokat adnak, hanem ténylegesen korlátozzák a natív és a valódi webes keresést
 - ha például csak a Facebook csoportok van bepipálva, akkor a query-builder és a backend megnyitási kártyák is csak ehhez a csomaghoz igazodnak
 - a felületen minden forráscsomag mellett látszik, pontosan mely domaineken keres az adott választás
+
+### M-Crucix - Előzmények, export, szolgáltatói idő, állapot-mátrix
+- Séma v2: `sources.published_at/modified_at/time_source`, `search_runs.health`, új `run_results` tábla.
+- Új modulok: `provenance`, `story`, `export`, `history`, `fetchx` (mind egységtesztelt).
+- Új parancsok: `search_history`, `inspect_source`, `export_sources`, `compare_search_runs`, `previous_run_delta`, `get_source_health`, `cluster_stories`.
+- Felület: Előzmények fül (Haladó mód), frissességi és történet-jelvények a találatokon, futam-különbség sáv, forrás-állapot chipek.

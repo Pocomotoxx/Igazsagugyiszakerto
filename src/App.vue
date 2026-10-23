@@ -5,6 +5,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import HelpTooltip from "./components/HelpTooltip.vue";
 import SourceReviewPanel from "./components/SourceReviewPanel.vue";
 import BrowserPanel from "./components/BrowserPanel.vue";
+import HistoryPanel from "./components/HistoryPanel.vue";
 import { openTab as openBrowserTab } from "./browserStore.js";
 
 const allTabs = [
@@ -13,6 +14,7 @@ const allTabs = [
   { id: "search", label: "Keresési Futam" },
   { id: "browser", label: "Böngésző" },
   { id: "archive", label: "Archivum" },
+  { id: "history", label: "Előzmények", advanced: true },
   { id: "audit", label: "Audit", advanced: true },
   { id: "report", label: "Riport" },
 ];
@@ -119,6 +121,66 @@ const lastSearchSummary = ref("");
 const appError = ref("");
 const searchWarning = ref("");
 const searchDiagnostics = ref(null);
+const runDelta = ref(null);
+const searchHealth = ref([]);
+const expandedStories = ref({});
+
+const stateRank = { hiba: 3, ok: 2, kihagyva: 1, kikapcsolva: 0 };
+
+function mergeHealth(outputs) {
+  const merged = new Map();
+  outputs.flatMap((output) => output.health || []).forEach((entry) => {
+    const current = merged.get(entry.id);
+    if (!current) {
+      merged.set(entry.id, { ...entry });
+      return;
+    }
+    current.count += entry.count;
+    current.ms += entry.ms;
+    if ((stateRank[entry.state] ?? 0) > (stateRank[current.state] ?? 0)) current.state = entry.state;
+    if (entry.error && !current.error) current.error = entry.error;
+  });
+  return Array.from(merged.values());
+}
+
+const visibleResults = computed(() => {
+  const seen = new Set();
+  return searchResults.value.filter((result) => {
+    if (!result.story_id || result.story_size < 2) return true;
+    if (expandedStories.value[result.story_id]) return true;
+    if (seen.has(result.story_id)) return false;
+    seen.add(result.story_id);
+    return true;
+  });
+});
+
+function hiddenInStory(result) {
+  if (!result.story_id || result.story_size < 2) return 0;
+  return expandedStories.value[result.story_id] ? 0 : result.story_size - 1;
+}
+
+function toggleStory(result) {
+  expandedStories.value = {
+    ...expandedStories.value,
+    [result.story_id]: !expandedStories.value[result.story_id],
+  };
+}
+
+const freshnessClass = (value) =>
+  value === "friss"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+    : value === "elavult"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : "border-slate-200 bg-slate-50 text-slate-500";
+
+const healthClass = (state) =>
+  state === "ok"
+    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+    : state === "hiba"
+      ? "border-rose-200 bg-rose-50 text-rose-700"
+      : "border-slate-200 bg-slate-50 text-slate-500";
+
+const formatDay = (iso) => (iso ? iso.slice(0, 10) : "");
 
 const newCaseTitle = ref("");
 const newCaseDesc = ref("");
@@ -1618,6 +1680,8 @@ async function runSearch() {
   appError.value = "";
   searchWarning.value = "";
   searchDiagnostics.value = null;
+  runDelta.value = null;
+  expandedStories.value = {};
   expandedResultKeys.value = {};
 
   try {
@@ -1684,6 +1748,27 @@ async function runSearch() {
     });
 
     searchResults.value = Array.from(unique.values()).sort((left, right) => right.relevance - left.relevance);
+    searchHealth.value = mergeHealth(outputs);
+
+    // Azonos történetek összevonása a teljes (több lekérdezésből összeállt) listán.
+    const retrievedIdx = searchResults.value
+      .map((item, index) => (item.evidence_level === "RETRIEVED" ? index : -1))
+      .filter((index) => index >= 0);
+    if (retrievedIdx.length > 1) {
+      try {
+        const ids = await api("cluster_stories", {
+          texts: retrievedIdx.map((i) => `${searchResults.value[i].title} ${searchResults.value[i].snippet}`),
+        });
+        const sizes = new Map();
+        ids.forEach((id) => sizes.set(id, (sizes.get(id) || 0) + 1));
+        retrievedIdx.forEach((resultIndex, position) => {
+          searchResults.value[resultIndex].story_id = ids[position] + 1;
+          searchResults.value[resultIndex].story_size = sizes.get(ids[position]);
+        });
+      } catch {
+        // az összevonás csak kényelmi funkció; hiba esetén a találatok önállóak maradnak
+      }
+    }
     searchDiagnostics.value = {
       generated: generatedCount,
       filteredOut: filteredOutCount,
@@ -1728,7 +1813,26 @@ async function runSearch() {
       tierFilter: selectedTierFilter.value,
       planCount: searchPlan.value.length,
       resultCount: searchResults.value.length,
+      results: searchResults.value.map((item) => ({
+        url: item.url,
+        title: item.title,
+        tier: item.tier,
+        source_type: item.source_type || "",
+        query_used: item.query_used || "",
+        published_at: item.published_at || "",
+        evidence_level: item.evidence_level || "",
+        story_id: item.story_id || 0,
+      })),
+      health: searchHealth.value,
     });
+    try {
+      runDelta.value = await api("previous_run_delta", {
+        caseId: currentCase.value.id,
+        runId: activeSearchRunId.value,
+      });
+    } catch {
+      runDelta.value = null;
+    }
     await Promise.all([loadAuditLogs(), loadSearchRuns()]);
   } catch (error) {
     appError.value = `Keresési hiba: ${String(error)}`;
@@ -1851,9 +1955,17 @@ async function archiveResultVariant(result, variant = "current") {
   busyArchiveId.value = `${result.url}|${variant}`;
   try {
     let fetchedSection = "";
+    let pageTimes = { published_at: result.published_at || "", modified_at: "", time_source: result.published_at ? "provider" : "" };
     if (!isSearchEngineUrl(targetUrl)) {
       try {
         const page = await api("fetch_page_text", { url: targetUrl });
+        if (page.published_at || page.modified_at) {
+          pageTimes = {
+            published_at: page.published_at || pageTimes.published_at,
+            modified_at: page.modified_at || "",
+            time_source: page.published_at ? page.time_source : pageTimes.time_source || page.time_source,
+          };
+        }
         if (page.text?.trim()) {
           fetchedSection = [
             "",
@@ -1861,6 +1973,9 @@ async function archiveResultVariant(result, variant = "current") {
             `Oldal címe: ${page.title || "nincs cím"}`,
             `HTTP státusz: ${page.status}`,
             `Végleges URL: ${page.final_url}`,
+            page.truncated ? "FIGYELEM: a letöltés a méretkorlát miatt csonka." : "",
+            page.published_at ? `Közzétéve (oldal jelzése): ${page.published_at}` : "",
+            page.modified_at ? `Módosítva (oldal jelzése): ${page.modified_at}` : "",
             "",
             page.text,
           ].join("\n");
@@ -1880,6 +1995,9 @@ async function archiveResultVariant(result, variant = "current") {
       title: archiveLabel,
       url: targetUrl,
       tier: result.tier,
+      publishedAt: pageTimes.published_at || null,
+      modifiedAt: pageTimes.modified_at || null,
+      timeSource: pageTimes.time_source || null,
       content: [
         `Cím: ${archiveLabel}`,
         `URL: ${targetUrl}`,
@@ -2841,9 +2959,31 @@ function tierBadgeClass(tier) {
               </div>
             </div>
 
+            <div v-if="searchHealth.length" class="mt-5 flex flex-wrap items-center gap-2">
+              <span class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Források</span>
+              <span
+                v-for="entry in searchHealth"
+                :key="entry.id"
+                :class="healthClass(entry.state)"
+                class="rounded-full border px-2.5 py-1 text-[11px] font-semibold"
+                :title="entry.error || `${entry.state}, ${entry.ms} ms`"
+              >
+                {{ entry.label }}: {{ entry.state }}{{ entry.state === 'ok' ? ` (${entry.count})` : '' }}
+              </span>
+            </div>
+
+            <div v-if="runDelta" class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+              Az előző azonos keresési futamhoz képest:
+              <strong>{{ runDelta.new_total }} új</strong>,
+              <strong>{{ runDelta.dropped_total }} kiesett</strong>,
+              {{ runDelta.kept_count }} változatlan találat.
+              <span v-if="runDelta.tier_changes.length">{{ runDelta.tier_changes.length }} találat tier-je változott.</span>
+              <button v-if="advanced" @click="currentTab = 'history'" class="ml-2 font-semibold underline">Részletek</button>
+            </div>
+
             <div class="mt-5 grid gap-4">
               <article
-                v-for="result in searchResults"
+                v-for="result in visibleResults"
                 :key="getSearchResultKey(result)"
                 class="rounded-3xl border border-slate-200 bg-white/90 p-5 shadow-sm"
               >
@@ -2864,6 +3004,22 @@ function tierBadgeClass(tier) {
                           {{ formatArchiveKind(result.archive_kind) }}
                         </span>
                         <span class="text-xs font-semibold text-slate-500">Relevancia: {{ result.relevance }}</span>
+                        <span
+                          v-if="result.freshness"
+                          :class="freshnessClass(result.freshness)"
+                          class="rounded-full border px-2.5 py-1 text-[11px] font-semibold"
+                          :title="result.published_at ? `Közzétéve: ${result.published_at}` : 'A szolgáltató nem adott közzétételi időt.'"
+                        >
+                          {{ result.published_at ? `${formatDay(result.published_at)} · ${result.freshness}` : "idő ismeretlen" }}
+                        </span>
+                        <button
+                          v-if="result.story_size > 1"
+                          @click="toggleStory(result)"
+                          class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[11px] font-semibold text-violet-700 hover:bg-violet-100"
+                          title="Ugyanarról a témáról szóló találatok"
+                        >
+                          {{ hiddenInStory(result) > 0 ? `+${hiddenInStory(result)} hasonló találat` : "Hasonlók elrejtése" }}
+                        </button>
                       </div>
                       <h3 class="mt-3 text-lg font-semibold text-slate-900">{{ result.title }}</h3>
                       <p class="mt-2 text-sm leading-6 text-slate-600">{{ result.snippet }}</p>
@@ -2933,6 +3089,14 @@ function tierBadgeClass(tier) {
             :suggestions="browserPlanSuggestions"
             @open-url="openInBrowserPanel"
             @archive="archiveBrowserTab"
+            @error="(message) => (appError = message)"
+          />
+        </section>
+
+        <section v-else-if="currentTab === 'history'" class="glass rounded-[28px] p-6">
+          <HistoryPanel
+            :case-id="currentCase?.id ?? null"
+            :search-runs="searchRuns"
             @error="(message) => (appError = message)"
           />
         </section>
