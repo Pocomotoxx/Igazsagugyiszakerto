@@ -287,19 +287,34 @@ fn site_tokens(platform: &Platform) -> Vec<String> {
         .collect()
 }
 
+/// Az évhatár Google-szintaxissal (" 2020..2022", " after:2020", " before:2022", " 2021").
+pub fn google_years(parsed: &ParsedQuery) -> String {
+    match (parsed.year_from, parsed.year_to) {
+        (Some(f), Some(t)) if f == t => format!(" {f}"),
+        (Some(f), Some(t)) => format!(" {f}..{t}"),
+        (Some(f), None) => format!(" after:{f}"),
+        (None, Some(t)) => format!(" before:{t}"),
+        (None, None) => String::new(),
+    }
+}
+
+/// Az általános (platformhoz nem kötött) Google-lekérdezés: operátorok, megadott site: szűrők, évhatár.
+pub fn google_query(parsed: &ParsedQuery) -> String {
+    let mut query = parsed.with_operators();
+    for site in &parsed.site {
+        query.push_str(&format!(" site:{site}"));
+    }
+    query.push_str(&google_years(parsed));
+    query.trim().to_string()
+}
+
 pub fn google_site_url(platform: &Platform, parsed: &ParsedQuery) -> String {
     let sites = site_tokens(platform)
         .into_iter()
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut query = format!("{} ({sites})", parsed.with_operators());
-    match (parsed.year_from, parsed.year_to) {
-        (Some(f), Some(t)) if f == t => query.push_str(&format!(" {f}")),
-        (Some(f), Some(t)) => query.push_str(&format!(" {f}..{t}")),
-        (Some(f), None) => query.push_str(&format!(" after:{f}")),
-        (None, Some(t)) => query.push_str(&format!(" before:{t}")),
-        (None, None) => {}
-    }
+    query.push_str(&google_years(parsed));
     format!("https://www.google.com/search?q={}", enc(query.trim()))
 }
 

@@ -193,7 +193,7 @@ const realHitCount = computed(
 const cardCount = computed(() => searchResults.value.length - realHitCount.value);
 const activeHealth = computed(() => searchHealth.value.filter((e) => e.state === "ok" || e.state === "hiba"));
 const inactiveHealthCount = computed(() => searchHealth.value.length - activeHealth.value.length);
-const ddgEntry = computed(() => searchHealth.value.find((e) => e.id === "ddg"));
+const ddgEntry = computed(() => searchHealth.value.find((e) => e.id === "browser" || e.id === "ddg"));
 
 const visibleResults = computed(() => {
   const seen = new Set();
@@ -2432,6 +2432,9 @@ function tierBadgeClass(tier) {
                 <button @click="setUiMode('advanced')" class="text-xs font-semibold text-slate-500 underline-offset-2 hover:underline">
                   Haladó beállítások…
                 </button>
+                <span v-if="isSearching" class="text-xs text-slate-500">
+                  A böngészős keresés platformonként fut, akár fél percig is tarthat.
+                </span>
               </div>
             </div>
 
@@ -2972,7 +2975,7 @@ function tierBadgeClass(tier) {
               v-else-if="ddgEntry?.state === 'ok'"
               class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900"
             >
-              A valódi találatok kulcs nélküli (DuckDuckGo, ennek hibája esetén Bing) lekérésből jönnek. Ez korlátozott és ingadozó lehet; ingyenes Tavily-kulccsal megbízhatóbb.
+              A valódi találatok a beépített böngészőből jönnek (Google, ennek ellenőrzése esetén Bing), kulcs nélkül. Lassabb, mint az API; ingyenes Tavily-kulccsal gyorsabb és megbízhatóbb.
             </div>
 
             <div v-if="activeHealth.length" class="mt-3 flex flex-wrap items-center gap-2">

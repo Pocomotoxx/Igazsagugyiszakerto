@@ -23,6 +23,7 @@ mod history;
 mod platforms;
 mod provenance;
 mod rss;
+mod scrape;
 mod story;
 
 const MAX_SEARCH_QUERY_LEN: usize = 2000;
@@ -1802,6 +1803,44 @@ fn add_rss_results(
     Ok((count, outcome.errors))
 }
 
+/// Kulcs nélküli vagy böngészős találatok felvétele; platformnál a platform címkéje, tier-je és relevanciája érvényes.
+fn push_hits(
+    results: &mut Vec<SearchResult>,
+    hits: Vec<ddg::DdgHit>,
+    query: &str,
+    platform: Option<&platforms::Platform>,
+) -> usize {
+    let count = hits.len();
+    for (index, hit) in hits.into_iter().enumerate() {
+        let (tier, source_type) = classify_result_tier(&hit.url);
+        push_detected_result(
+            results,
+            0,
+            &hit.title,
+            hit.url,
+            if hit.snippet.is_empty() {
+                "Valódi webes találat.".to_string()
+            } else {
+                hit.snippet
+            },
+            tier,
+            source_type,
+            (92 - (index as i32) * 3).max(55),
+            query.to_string(),
+            "Megnyitás",
+        );
+        if let (Some(platform), Some(last)) = (platform, results.last_mut()) {
+            last.source_type = platform.label.to_string();
+            last.tier = platform.tier;
+            last.relevance = (platform.relevance - (index as i32) * 2).max(55);
+            if !platform.path.is_empty() && last.url.contains(platform.path) {
+                last.relevance = (last.relevance + 5).min(100);
+            }
+        }
+    }
+    count
+}
+
 type PlatformOutcome = (String, Result<Vec<SearchResult>, String>);
 
 /// A bekapcsolt site- és RSS-platformok lekérése párhuzamosan. Visszaadja a találatokat
@@ -1809,6 +1848,7 @@ type PlatformOutcome = (String, Result<Vec<SearchResult>, String>);
 fn run_platform_searches(
     settings: &AppSettings,
     include_cse: bool,
+    include_sites: bool,
     parsed: &platforms::ParsedQuery,
     enabled_ids: &[String],
 ) -> (Vec<PlatformOutcome>, Vec<ProviderHealth>) {
@@ -1819,7 +1859,7 @@ fn run_platform_searches(
     let active: Vec<&platforms::Platform> = platforms::PLATFORMS
         .iter()
         .filter(|p| platforms::enabled(enabled_ids, p.id))
-        .filter(|p| p.kind == platforms::Kind::Site || p.kind == platforms::Kind::Rss)
+        .filter(|p| (include_sites && p.kind == platforms::Kind::Site) || p.kind == platforms::Kind::Rss)
         .collect();
 
     type Found = Result<(Vec<SearchResult>, String), String>;
@@ -2906,6 +2946,7 @@ fn update_source_review(
 
 #[tauri::command]
 async fn execute_search(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DbState>,
     case_id: i64,
     search_query: String,
@@ -2922,6 +2963,7 @@ async fn execute_search(
     let enabled_platforms = enabled_platforms.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         execute_search_blocking(
+            Some(&app),
             &db_path,
             case_id,
             &search_query,
@@ -2938,6 +2980,7 @@ async fn execute_search(
 }
 
 fn execute_search_blocking(
+    app: Option<&tauri::AppHandle>,
     db_path: &str,
     case_id: i64,
     search_query: &str,
@@ -3121,7 +3164,75 @@ fn execute_search_blocking(
         let any_provider_configured = !settings.tavily_key.trim().is_empty()
             || !settings.brave_key.trim().is_empty()
             || cse_configured;
-        if include_cse && !any_provider_configured && parsed_query.has_terms() {
+        let browser_mode =
+            include_cse && !any_provider_configured && parsed_query.has_terms() && app.is_some();
+        let mut platform_outcomes: Vec<PlatformOutcome> = Vec::new();
+        if browser_mode {
+            let app_handle = app.expect("browser_mode csak alkalmazásablakkal");
+            let general_query = platforms::google_query(&parsed_query);
+            let mut queries = vec![("general".to_string(), general_query.clone())];
+            for platform in platforms::PLATFORMS {
+                if platform.kind == platforms::Kind::Site && platforms::enabled(enabled_platforms, platform.id) {
+                    queries.push((platform.id.to_string(), platforms::site_api_query(platform, &parsed_query)));
+                }
+            }
+            let t_batch = Instant::now();
+            let batch = scrape::run_batch(app_handle, queries.clone());
+            let batch_ms = t_batch.elapsed().as_millis() as i64;
+            let per_query_ms = batch_ms / (batch.len().max(1) as i64);
+            for (key, outcome) in batch {
+                let query_text = queries.iter().find(|(k, _)| *k == key).map(|(_, q)| q.clone()).unwrap_or_default();
+                if key == "general" {
+                    let mut found: Vec<SearchResult> = Vec::new();
+                    let mut result = outcome.map(|hits| push_hits(&mut found, hits, &query_text, None));
+                    if result.is_err() || found.is_empty() {
+                        // tartalék: HTTP-alapú kulcs nélküli keresés
+                        if let Ok(count) = add_ddg_results(&mut found, &query_text) {
+                            result = Ok(count);
+                        }
+                    }
+                    let n = found.len() as i32;
+                    results.extend(found);
+                    health.push(ProviderHealth {
+                        id: "browser".into(),
+                        label: "Böngészős keresés (Google/Bing)".into(),
+                        state: if result.is_ok() { "ok" } else { "hiba" }.into(),
+                        count: n,
+                        ms: per_query_ms,
+                        error: result.err().unwrap_or_default(),
+                    });
+                } else if let Some(platform) = platforms::PLATFORMS.iter().find(|p| p.id == key) {
+                    let mut found: Vec<SearchResult> = Vec::new();
+                    match outcome {
+                        Ok(hits) => {
+                            push_hits(&mut found, hits, &query_text, Some(platform));
+                            health.push(ProviderHealth {
+                                id: platform.id.into(),
+                                label: platform.label.into(),
+                                state: "ok".into(),
+                                count: found.len() as i32,
+                                ms: per_query_ms,
+                                error: String::new(),
+                            });
+                            platform_outcomes.push((platform.label.to_string(), Ok(found)));
+                        }
+                        Err(error) => {
+                            health.push(ProviderHealth {
+                                id: platform.id.into(),
+                                label: platform.label.into(),
+                                state: "hiba".into(),
+                                count: 0,
+                                ms: per_query_ms,
+                                error: error.clone(),
+                            });
+                            platform_outcomes.push((platform.label.to_string(), Err(error)));
+                        }
+                    }
+                }
+            }
+        }
+
+        if include_cse && !any_provider_configured && !browser_mode && parsed_query.has_terms() {
             let t_ddg = Instant::now();
             let n_ddg = results.len();
             let mut ddg_query = parsed_query.with_operators();
@@ -3150,12 +3261,14 @@ fn execute_search_blocking(
         }
 
         // Platformonkénti, a platformhoz igazított lekérdezések (párhuzamosan).
-        let (platform_results, platform_health) = run_platform_searches(
+        let (mut platform_results, platform_health) = run_platform_searches(
             &settings,
             include_cse,
+            !browser_mode,
             &parsed_query,
             enabled_platforms,
         );
+        platform_results.extend(platform_outcomes);
         for (platform, outcome) in &platform_results {
             if let Err(error) = outcome {
                 let _ = log_action(
@@ -4342,13 +4455,13 @@ mod tests {
         let settings = default_app_settings();
         let parsed = platforms::parse_query("óradíj");
         let (outcomes, health) =
-            run_platform_searches(&settings, false, &parsed, &["facebook".to_string(), "magyar_kozlony".to_string()]);
+            run_platform_searches(&settings, false, true, &parsed, &["facebook".to_string(), "magyar_kozlony".to_string()]);
         assert!(outcomes.is_empty());
         assert_eq!(health.len(), 2);
         assert!(health.iter().all(|h| h.state == "kikapcsolva"));
 
         let empty = platforms::parse_query("site:ksh.hu 2020..2022");
-        let (o, h) = run_platform_searches(&settings, true, &empty, &[]);
+        let (o, h) = run_platform_searches(&settings, true, true, &empty, &[]);
         assert!(o.is_empty() && h.is_empty());
     }
 

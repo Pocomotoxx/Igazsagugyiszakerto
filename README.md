@@ -89,3 +89,10 @@ A domainre szűkített valódi keresés platformonként egy hívás az első be�
 - Ha egyik webes keresőszolgáltatás (Tavily, Brave, Google CSE) sincs beállítva, a valódi találatokat a DuckDuckGo HTML-oldala adja kulcs nélkül (ha az hibázik vagy üres, a Bing HTML-oldala), szándékosan lassan (időközzel, a korlátozás jelzésével). Ez tartalék: ingadozhat, ezért a felület jelzi, honnan jönnek a találatok. Megbízható működéshez érdemes egy ingyenes Tavily-kulcs.
 - A keresési eredmények tetején a valódi találatok állnak, utánuk a keresőkártyák; a lista fölött látszik a kettő darabszáma.
 - Az RSS-szűrés szóhatáron kezdődő egyezést keres (ragozott alak igen, a szó közepe nem): a „takarítás” nem találja meg az „időmegtakarítás” szót.
+
+### Böngészős keresés (kulcs nélkül)
+
+Ha nincs beállítva Tavily, Brave vagy Google CSE kulcs, az alkalmazás a beépített Chromiummal (WebView2) keres: egy képernyőn kívüli ablakban betölti a Google találati oldalát (ellenőrzés vagy üres válasz esetén a Binget), és a találatokat az oldalról olvassa ki. A kérés az általános lekérdezésre és minden bekapcsolt, domainre szűkíthető platformra egymás után fut, 1,2 másodperc időközzel. A visszajuttatás IPC nélkül történik (az oldalba injektált szkript egy elfogott, megszakított navigációval adja át a találatokat), ezért a betöltött oldal nem fér hozzá az alkalmazás parancsaihoz.
+
+- **Első indításkor** a Google hozzájárulási oldala megjelenhet; a szkript elfogadja. Ha a Google captchát kér, a futam hátralévő része Bingen fut, és a „Források" sorban hiba látszik. Ilyenkor a Böngésző fülön nyisd meg a Google-t, és oldd meg egyszer az ellenőrzést: a böngészőpanel és a keresőablak közös profilt használ.
+- A böngészős keresés lassabb az API-nál (platformonként néhány másodperc), és a találatok a Google aktuális oldalszerkezetétől függnek. Ha a Google átalakítja az oldalt, a kiolvasó szkriptet (`src-tauri/src/scrape.rs`) kell frissíteni. Tartós használathoz egy ingyenes Tavily-kulcs gyorsabb és stabilabb.
