@@ -86,6 +86,6 @@ A domainre szűkített valódi keresés platformonként egy hívás az első be�
 
 ### Kulcs nélküli működés és a találatok pontossága
 
-- Ha egyik webes keresőszolgáltatás (Tavily, Brave, Google CSE) sincs beállítva, a valódi találatokat a DuckDuckGo HTML-oldala adja kulcs nélkül, szándékosan lassan (időközzel, a korlátozás jelzésével). Ez tartalék: ingadozhat, ezért a felület jelzi, honnan jönnek a találatok. Megbízható működéshez érdemes egy ingyenes Tavily-kulcs.
+- Ha egyik webes keresőszolgáltatás (Tavily, Brave, Google CSE) sincs beállítva, a valódi találatokat a DuckDuckGo HTML-oldala adja kulcs nélkül (ha az hibázik vagy üres, a Bing HTML-oldala), szándékosan lassan (időközzel, a korlátozás jelzésével). Ez tartalék: ingadozhat, ezért a felület jelzi, honnan jönnek a találatok. Megbízható működéshez érdemes egy ingyenes Tavily-kulcs.
 - A keresési eredmények tetején a valódi találatok állnak, utánuk a keresőkártyák; a lista fölött látszik a kettő darabszáma.
 - Az RSS-szűrés szóhatáron kezdődő egyezést keres (ragozott alak igen, a szó közepe nem): a „takarítás” nem találja meg az „időmegtakarítás” szót.

@@ -155,7 +155,7 @@ pub fn parse_results(html: &str) -> Vec<DdgHit> {
     hits
 }
 
-fn throttle() {
+pub fn throttle() {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     if let Ok(mut last) = LAST.lock() {
         if let Some(at) = *last {

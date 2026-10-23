@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 
+mod bing;
 mod ddg;
 mod export;
 mod fetchx;
@@ -1677,8 +1678,30 @@ fn ddg_client() -> Result<&'static Client, String> {
     Ok(CELL.get().expect("just set"))
 }
 
+/// Kulcs nélküli keresés: előbb DuckDuckGo, ha az hibázik vagy üres, akkor Bing.
+fn keyless_search(query: &str) -> Result<Vec<ddg::DdgHit>, String> {
+    let client = ddg_client()?;
+    match ddg::search(client, query) {
+        Ok(hits) if !hits.is_empty() => Ok(hits),
+        first => match bing::search(client, query) {
+            Ok(hits) if !hits.is_empty() => Ok(hits),
+            second => {
+                let first_note = match &first {
+                    Ok(_) => "DuckDuckGo: nincs találat".to_string(),
+                    Err(e) => e.clone(),
+                };
+                match second {
+                    Ok(_) if first.is_ok() => Ok(Vec::new()),
+                    Ok(_) => Err(first_note),
+                    Err(e) => Err(format!("{first_note} | {e}")),
+                }
+            }
+        },
+    }
+}
+
 fn add_ddg_results(results: &mut Vec<SearchResult>, query: &str) -> Result<usize, String> {
-    let hits = ddg::search(ddg_client()?, query)?;
+    let hits = keyless_search(query)?;
     let count = hits.len();
     for (index, hit) in hits.into_iter().enumerate() {
         let (tier, source_type) = classify_result_tier(&hit.url);
@@ -1688,7 +1711,7 @@ fn add_ddg_results(results: &mut Vec<SearchResult>, query: &str) -> Result<usize
             &hit.title,
             hit.url,
             if hit.snippet.is_empty() {
-                "Valódi webes találat a DuckDuckGo-ból (kulcs nélkül).".to_string()
+                "Valódi webes találat (kulcs nélküli keresés).".to_string()
             } else {
                 hit.snippet
             },
@@ -3118,7 +3141,7 @@ fn execute_search_blocking(
             }
             health.push(ProviderHealth {
                 id: "ddg".into(),
-                label: "DuckDuckGo (kulcs nélkül)".into(),
+                label: "Kulcs nélküli keresés (DuckDuckGo/Bing)".into(),
                 state: if error.is_some() { "hiba" } else { "ok" }.into(),
                 count: (results.len() - n_ddg) as i32,
                 ms: t_ddg.elapsed().as_millis() as i64,

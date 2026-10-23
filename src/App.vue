@@ -2972,7 +2972,7 @@ function tierBadgeClass(tier) {
               v-else-if="ddgEntry?.state === 'ok'"
               class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900"
             >
-              A valódi találatok kulcs nélküli DuckDuckGo-lekérésből jönnek. Ez korlátozott és ingadozó lehet; ingyenes Tavily-kulccsal megbízhatóbb.
+              A valódi találatok kulcs nélküli (DuckDuckGo, ennek hibája esetén Bing) lekérésből jönnek. Ez korlátozott és ingadozó lehet; ingyenes Tavily-kulccsal megbízhatóbb.
             </div>
 
             <div v-if="activeHealth.length" class="mt-3 flex flex-wrap items-center gap-2">
