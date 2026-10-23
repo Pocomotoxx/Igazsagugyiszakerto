@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 
+mod ddg;
 mod export;
 mod fetchx;
 mod history;
@@ -1658,6 +1659,47 @@ enum SiteProvider<'a> {
     Tavily(&'a str),
     Brave(&'a str),
     Cse(&'a str, &'a str),
+    /// Kulcs nélküli tartalék (DuckDuckGo HTML), ha egyik szolgáltató sincs beállítva.
+    Ddg,
+}
+
+fn ddg_client() -> Result<&'static Client, String> {
+    static CELL: OnceLock<Client> = OnceLock::new();
+    if let Some(c) = CELL.get() {
+        return Ok(c);
+    }
+    let c = Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("HTTP kliens inicializálási hiba: {e}"))?;
+    let _ = CELL.set(c);
+    Ok(CELL.get().expect("just set"))
+}
+
+fn add_ddg_results(results: &mut Vec<SearchResult>, query: &str) -> Result<usize, String> {
+    let hits = ddg::search(ddg_client()?, query)?;
+    let count = hits.len();
+    for (index, hit) in hits.into_iter().enumerate() {
+        let (tier, source_type) = classify_result_tier(&hit.url);
+        push_detected_result(
+            results,
+            0,
+            &hit.title,
+            hit.url,
+            if hit.snippet.is_empty() {
+                "Valódi webes találat a DuckDuckGo-ból (kulcs nélkül).".to_string()
+            } else {
+                hit.snippet
+            },
+            tier,
+            source_type,
+            (92 - (index as i32) * 3).max(55),
+            query.to_string(),
+            "Megnyitás",
+        );
+    }
+    Ok(count)
 }
 
 /// Melyik valódi webes keresőszolgáltatás fut a platformonkénti keresésekhez: egy hívás
@@ -1678,7 +1720,7 @@ fn pick_site_provider(settings: &AppSettings, include_cse: bool) -> Option<SiteP
             settings.google_cse_cx.trim(),
         ));
     }
-    None
+    Some(SiteProvider::Ddg)
 }
 
 fn run_site_search(
@@ -1692,6 +1734,7 @@ fn run_site_search(
         SiteProvider::Tavily(key) => add_tavily_results(&mut local, &query, key)?,
         SiteProvider::Brave(key) => add_brave_results(&mut local, &query, key)?,
         SiteProvider::Cse(key, cx) => add_cse_results(&mut local, &query, key, cx)?,
+        SiteProvider::Ddg => add_ddg_results(&mut local, &query)?,
     };
     for (index, result) in local.iter_mut().enumerate() {
         result.source_type = platform.label.to_string();
@@ -1810,7 +1853,7 @@ fn run_platform_searches(
                 state: "kikapcsolva".into(),
                 count: 0,
                 ms,
-                error: "Nincs beállított webes keresőszolgáltatás (Tavily, Brave vagy Google CSE).".into(),
+                error: "A webes lekérés ki van kapcsolva ennél a futásnál.".into(),
             }),
             Some(Ok((found, note))) => {
                 health.push(ProviderHealth {
@@ -3050,6 +3093,39 @@ fn execute_search_blocking(
             &cse_error, results.len() - n_cse, t_cse,
         ));
 
+        // Ha egyik webes keresőszolgáltatás sincs beállítva, a kulcs nélküli DuckDuckGo-lekérés
+        // adja a valódi találatokat (az állapot-mátrixban külön sorként látszik).
+        let any_provider_configured = !settings.tavily_key.trim().is_empty()
+            || !settings.brave_key.trim().is_empty()
+            || cse_configured;
+        if include_cse && !any_provider_configured && parsed_query.has_terms() {
+            let t_ddg = Instant::now();
+            let n_ddg = results.len();
+            let mut ddg_query = parsed_query.with_operators();
+            for site in &parsed_query.site {
+                ddg_query.push_str(&format!(" site:{site}"));
+            }
+            let outcome = add_ddg_results(&mut results, ddg_query.trim());
+            let error = outcome.as_ref().err().map(|e| redact_secrets(e, &settings));
+            if let Some(message) = &error {
+                let _ = log_action(
+                    db_path,
+                    case_id,
+                    "ddg_search_error",
+                    trimmed,
+                    &format!("A kulcs nélküli keresés nem futott le: {message}"),
+                );
+            }
+            health.push(ProviderHealth {
+                id: "ddg".into(),
+                label: "DuckDuckGo (kulcs nélkül)".into(),
+                state: if error.is_some() { "hiba" } else { "ok" }.into(),
+                count: (results.len() - n_ddg) as i32,
+                ms: t_ddg.elapsed().as_millis() as i64,
+                error: error.unwrap_or_default(),
+            });
+        }
+
         // Platformonkénti, a platformhoz igazított lekérdezések (párhuzamosan).
         let (platform_results, platform_health) = run_platform_searches(
             &settings,
@@ -4243,7 +4319,7 @@ mod tests {
         let settings = default_app_settings();
         let parsed = platforms::parse_query("óradíj");
         let (outcomes, health) =
-            run_platform_searches(&settings, true, &parsed, &["facebook".to_string(), "magyar_kozlony".to_string()]);
+            run_platform_searches(&settings, false, &parsed, &["facebook".to_string(), "magyar_kozlony".to_string()]);
         assert!(outcomes.is_empty());
         assert_eq!(health.len(), 2);
         assert!(health.iter().all(|h| h.state == "kikapcsolva"));
@@ -4256,7 +4332,9 @@ mod tests {
     #[test]
     fn site_provider_priority_is_tavily_then_brave_then_cse() {
         let mut settings = default_app_settings();
-        assert!(pick_site_provider(&settings, true).is_none());
+        // kulcs nélkül a DuckDuckGo-tartalék él, de csak ha a webes lekérés engedélyezett
+        assert!(matches!(pick_site_provider(&settings, true), Some(SiteProvider::Ddg)));
+        assert!(pick_site_provider(&settings, false).is_none());
         settings.google_cse_key = "k".into();
         settings.google_cse_cx = "cx".into();
         assert!(matches!(pick_site_provider(&settings, true), Some(SiteProvider::Cse(_, _))));

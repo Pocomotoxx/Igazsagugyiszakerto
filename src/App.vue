@@ -187,6 +187,14 @@ function mergeHealth(outputs) {
   return Array.from(merged.values());
 }
 
+const realHitCount = computed(
+  () => searchResults.value.filter((item) => item.evidence_level === "RETRIEVED").length,
+);
+const cardCount = computed(() => searchResults.value.length - realHitCount.value);
+const activeHealth = computed(() => searchHealth.value.filter((e) => e.state === "ok" || e.state === "hiba"));
+const inactiveHealthCount = computed(() => searchHealth.value.length - activeHealth.value.length);
+const ddgEntry = computed(() => searchHealth.value.find((e) => e.id === "ddg"));
+
 const visibleResults = computed(() => {
   const seen = new Set();
   return searchResults.value.filter((result) => {
@@ -1801,7 +1809,11 @@ async function runSearch() {
       }
     });
 
-    searchResults.value = Array.from(unique.values()).sort((left, right) => right.relevance - left.relevance);
+    // A valódi találatok előre kerülnek, utánuk a keresőkártyák; mindkét csoporton belül relevancia szerint.
+    const isReal = (item) => (item.evidence_level === "RETRIEVED" ? 1 : 0);
+    searchResults.value = Array.from(unique.values()).sort(
+      (left, right) => isReal(right) - isReal(left) || right.relevance - left.relevance,
+    );
     searchHealth.value = mergeHealth(outputs);
 
     // Azonos történetek összevonása a teljes (több lekérdezésből összeállt) listán.
@@ -2944,10 +2956,29 @@ function tierBadgeClass(tier) {
               </div>
             </div>
 
-            <div v-if="searchHealth.length" class="mt-5 flex flex-wrap items-center gap-2">
+            <div v-if="searchResults.length" class="mt-5 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
+              <strong>{{ realHitCount }}</strong> valódi találat · <strong>{{ cardCount }}</strong> keresőkártya
+              <span class="text-slate-500">(a kártyák a platform saját keresőjét nyitják meg, a lekérdezéssel kitöltve)</span>
+            </div>
+            <div
+              v-if="searchResults.length && realHitCount === 0"
+              class="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+            >
+              Nem érkezett valódi webes találat. Ilyenkor csak a keresőkártyák állnak rendelkezésre.
+              <span v-if="ddgEntry?.state === 'hiba'">{{ ddgEntry.error }}</span>
+              <span v-else>Állíts be egy ingyenes Tavily-kulcsot (Haladó mód, Keresési futam) a megbízható, platformonkénti találatokhoz.</span>
+            </div>
+            <div
+              v-else-if="ddgEntry?.state === 'ok'"
+              class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900"
+            >
+              A valódi találatok kulcs nélküli DuckDuckGo-lekérésből jönnek. Ez korlátozott és ingadozó lehet; ingyenes Tavily-kulccsal megbízhatóbb.
+            </div>
+
+            <div v-if="activeHealth.length" class="mt-3 flex flex-wrap items-center gap-2">
               <span class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Források</span>
               <span
-                v-for="entry in searchHealth"
+                v-for="entry in activeHealth"
                 :key="entry.id"
                 :class="healthClass(entry.state)"
                 class="rounded-full border px-2.5 py-1 text-[11px] font-semibold"
@@ -2955,6 +2986,7 @@ function tierBadgeClass(tier) {
               >
                 {{ entry.label }}: {{ entry.state }}{{ entry.state === 'ok' ? ` (${entry.count})` : '' }}
               </span>
+              <span v-if="inactiveHealthCount" class="text-[11px] text-slate-400">+ {{ inactiveHealthCount }} kikapcsolt vagy kihagyott</span>
             </div>
 
             <div v-if="runDelta" class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">

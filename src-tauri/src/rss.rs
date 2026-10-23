@@ -206,14 +206,53 @@ pub fn parse_feed(xml: &str, feed_label: &str, now: chrono::DateTime<chrono::Utc
         .collect()
 }
 
-/// Egy hír megfelel-e a kifejezésnek (kis/nagybetű- és ékezetfüggetlen, részszó-egyezés).
+/// A `needle` szóhatáron kezdődő előfordulása a (már hajtogatott) szövegben. A szó eleje számít,
+/// a vége nem, így a ragozott alak egyezik ("takarításra"), de a szó közepe nem
+/// ("időmegtakarítás" nem találat a "takarítás"-ra).
+fn boundary_find(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(pos) = haystack[from..].find(needle) {
+        let at = from + pos;
+        let before_ok = at == 0
+            || !haystack[..at]
+                .chars()
+                .next_back()
+                .map_or(false, |c| c.is_alphanumeric());
+        if before_ok {
+            return true;
+        }
+        from = at + needle.chars().next().map_or(1, |c| c.len_utf8());
+    }
+    false
+}
+
+/// Egy szó tövének közelítése a ragozás kezeléséhez: hosszabb szónál a végéről 1-2 betű elhagyható.
+fn stem_prefix(folded_word: &str) -> String {
+    let n = folded_word.chars().count();
+    let keep = if n >= 8 { n - 2 } else if n >= 6 { n - 1 } else { n };
+    folded_word.chars().take(keep).collect()
+}
+
+/// Egy hír megfelel-e a kifejezésnek (kis/nagybetű- és ékezetfüggetlen, szóelejei egyezés).
 /// Minden kötelező szó és kifejezés kell, minden csoportból legalább egy szó, kizárt szó nem.
 /// A kifejezésben megadott évtartományon kívüli, ismert dátumú hír nem felel meg.
 pub fn matches(item: &FeedItem, parsed: &ParsedQuery) -> bool {
     let haystack = story::fold(&format!("{} {}", item.title, item.summary));
     let contains = |needle: &str| {
         let n = story::fold(needle);
-        !n.is_empty() && haystack.contains(&n)
+        let n = n.trim();
+        if n.is_empty() {
+            return false;
+        }
+        // kifejezésnél a teljes sorozat egyezik szóhatáron, egy szónál a tő
+        if n.contains(' ') {
+            boundary_find(&haystack, n)
+        } else {
+            boundary_find(&haystack, &stem_prefix(n))
+        }
     };
     if !parsed.must.iter().all(|w| contains(w)) || !parsed.phrases.iter().all(|p| contains(p)) {
         return false;
@@ -375,6 +414,27 @@ mod tests {
 
         let p = parse_query("\"igazságügyi szakértők\"");
         assert_eq!(items.iter().filter(|i| matches(i, &p)).count(), 1);
+    }
+
+    #[test]
+    fn matches_word_starts_only_not_the_middle_of_words() {
+        let item = |title: &str, summary: &str| FeedItem {
+            feed: "t".into(),
+            title: title.into(),
+            link: "https://x.hu/".into(),
+            summary: summary.into(),
+            published_at: String::new(),
+        };
+        let p = parse_query("takarítás");
+        // a "megtakarítás" közepén szereplő "takarítás" nem találat
+        assert!(!matches(&item("905 méteres mozgólépcső", "az időmegtakarítás és a kényelem"), &p));
+        assert!(!matches(&item("Megtakarítás", ""), &p));
+        // ragozott és rokon alakok igen
+        assert!(matches(&item("Takarításra keresnek munkatársat", ""), &p));
+        assert!(matches(&item("Új takarító cég", ""), &p));
+        assert!(matches(&item("A takarítók bére", ""), &p));
+        // rövid szavaknál a teljes szó kezdete kell
+        assert!(!matches(&item("Bérlet és bérház", ""), &parse_query("kér")));
     }
 
     #[test]

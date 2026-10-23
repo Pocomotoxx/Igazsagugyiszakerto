@@ -83,3 +83,9 @@ A keresés nem keresőmotor-választással működik. Minden kérés minden beka
 | Magyar hírcsatornák (RSS) | 10 hírcsatorna közvetlen lekérése és szűrése a kifejezésre (ékezetfüggetlen, évtartománnyal), a csatorna saját közzétételi idejével |
 
 A domainre szűkített valódi keresés platformonként egy hívás az első beállított szolgáltatóval (Tavily, ennek hiányában Brave, majd Google CSE). Ha egyik sincs beállítva, a platformokhoz keresőkártya készül, a forrás-állapot mátrixban pedig „kikapcsolva” szerepel. A platformok a Haladó módban, a keresési panel „Platformok” kártyáján kapcsolhatók ki; a választás megmarad.
+
+### Kulcs nélküli működés és a találatok pontossága
+
+- Ha egyik webes keresőszolgáltatás (Tavily, Brave, Google CSE) sincs beállítva, a valódi találatokat a DuckDuckGo HTML-oldala adja kulcs nélkül, szándékosan lassan (időközzel, a korlátozás jelzésével). Ez tartalék: ingadozhat, ezért a felület jelzi, honnan jönnek a találatok. Megbízható működéshez érdemes egy ingyenes Tavily-kulcs.
+- A keresési eredmények tetején a valódi találatok állnak, utánuk a keresőkártyák; a lista fölött látszik a kettő darabszáma.
+- Az RSS-szűrés szóhatáron kezdődő egyezést keres (ragozott alak igen, a szó közepe nem): a „takarítás” nem találja meg az „időmegtakarítás” szót.
