@@ -183,6 +183,7 @@ pub enum Native {
     Bing,
     Ddg,
     Scholar,
+    GoogleNews,
     Facebook,
     Reddit,
     X,
@@ -206,6 +207,7 @@ pub struct Platform {
 
 pub const PLATFORMS: &[Platform] = &[
     Platform { id: "google", label: "Google", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Google, relevance: 92, path: "", landing: "" },
+    Platform { id: "google_hirek", label: "Google Hírek", tier: 3, source_type: "Hírforrás", kind: Kind::Engine, domains: &[], native: Native::GoogleNews, relevance: 90, path: "", landing: "" },
     Platform { id: "bing", label: "Bing", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Bing, relevance: 90, path: "", landing: "" },
     Platform { id: "duckduckgo", label: "DuckDuckGo", tier: 3, source_type: "Keresőmotor", kind: Kind::Engine, domains: &[], native: Native::Ddg, relevance: 88, path: "", landing: "" },
     Platform { id: "scholar", label: "Google Scholar", tier: 2, source_type: "Tudományos forrás", kind: Kind::Engine, domains: &[], native: Native::Scholar, relevance: 84, path: "", landing: "" },
@@ -251,6 +253,10 @@ pub fn native_url(native: Native, original: &str, parsed: &ParsedQuery) -> Optio
         Native::Google => format!("https://www.google.com/search?q={}", enc(original)),
         Native::Bing => format!("https://www.bing.com/search?q={}", enc(&with_site(&ops, parsed))),
         Native::Ddg => format!("https://duckduckgo.com/?q={}", enc(&with_site(&ops, parsed))),
+        Native::GoogleNews => format!(
+            "https://www.google.com/search?q={}&tbm=nws&hl=hu&gl=hu",
+            enc(original)
+        ),
         Native::Scholar => {
             let mut url = format!("https://scholar.google.com/scholar?hl=hu&q={}", enc(&ops));
             if let Some(from) = parsed.year_from {
@@ -328,6 +334,53 @@ pub fn site_api_query(platform: &Platform, parsed: &ParsedQuery) -> String {
         sites.join(" ")
     };
     format!("{} {group}", parsed.with_operators()).trim().to_string()
+}
+
+/// Böngészőfülben nyitandó cím egy platformhoz. A bejelentkezést kérő platformok (Facebook, X)
+/// domainre szűkített Google-keresésen át nyílnak, így a találatok bejelentkezés nélkül is látszanak.
+pub fn tab_url(platform: &Platform, original: &str, parsed: &ParsedQuery) -> Option<String> {
+    match platform.id {
+        "facebook" | "x" => {
+            let domains: &[&str] = if platform.id == "x" { &["x.com", "twitter.com"] } else { platform.domains };
+            let sites = domains.iter().map(|d| format!("site:{d}")).collect::<Vec<_>>().join(" OR ");
+            let query = format!("{} ({sites}){}", parsed.with_operators(), google_years(parsed));
+            Some(format!("https://www.google.com/search?q={}&hl=hu&gl=hu", enc(query.trim())))
+        }
+        _ => match platform.kind {
+            Kind::Engine => native_url(platform.native, original, parsed),
+            Kind::Site => native_url(platform.native, original, parsed)
+                .or_else(|| Some(google_site_url(platform, parsed))),
+            Kind::Rss => None,
+        },
+    }
+}
+
+/// Minden bekapcsolt platform böngészőfüle (és a saját keresőoldalak) a megadott sorrendben.
+pub fn tab_links(original: &str, enabled_ids: &[String]) -> Vec<PlatformLink> {
+    let parsed = parse_query(original);
+    let mut out = Vec::new();
+    for platform in PLATFORMS {
+        if !enabled(enabled_ids, platform.id) {
+            continue;
+        }
+        if let Some(url) = tab_url(platform, original, &parsed) {
+            out.push(PlatformLink {
+                id: platform.id.to_string(),
+                label: platform.label.to_string(),
+                url,
+                query: parsed.with_operators(),
+            });
+        }
+        if !platform.landing.is_empty() {
+            out.push(PlatformLink {
+                id: format!("{}_oldal", platform.id),
+                label: format!("{} – saját keresőoldal", platform.label),
+                url: platform.landing.to_string(),
+                query: parsed.plain(),
+            });
+        }
+    }
+    out
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -450,6 +503,24 @@ mod tests {
         let landing: Vec<&str> = links.iter().filter(|l| l.id.ends_with("_oldal")).map(|l| l.url.as_str()).collect();
         assert!(landing.contains(&"https://eakta.birosag.hu/anonimizalt-hatarozatok"));
         assert!(landing.contains(&"https://kuria-birosag.hu/hu/jogegysegi-hatarozatok-hatalyos"));
+    }
+
+    #[test]
+    fn tab_links_use_google_site_search_for_login_walled_platforms() {
+        let tabs = tab_links("takarítás eger órabér 2020..2022", &[]);
+        let by_id = |id: &str| tabs.iter().find(|t| t.id == id).map(|t| t.url.clone()).unwrap_or_default();
+        let fb = by_id("facebook");
+        assert!(fb.contains("google.com/search") && fb.contains("site%3Afacebook.com"), "{fb}");
+        let x = by_id("x");
+        assert!(x.contains("google.com/search") && x.contains("site%3Ax.com"), "{x}");
+        assert!(by_id("google_hirek").contains("tbm=nws"));
+        assert!(by_id("reddit").contains("reddit.com/search"));
+        assert!(by_id("magyar_kozlony").contains("magyarkozlony.hu"));
+        assert!(by_id("eakta_oldal").starts_with("https://eakta.birosag.hu/"));
+        assert!(!tabs.iter().any(|t| t.id == "hu_rss"));
+        // a sorrend a platform-táblát követi: az első a Google
+        assert_eq!(tabs[0].id, "google");
+        assert_eq!(tab_links("x", &["facebook".to_string()]).len(), 1);
     }
 
     #[test]

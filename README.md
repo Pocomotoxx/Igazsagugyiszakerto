@@ -100,3 +100,14 @@ Ha nincs beállítva Tavily, Brave vagy Google CSE kulcs, az alkalmazás a beép
 ### Eredmények platformonként (fülek)
 
 A keresési találatok a lista fölötti fülekre oszlanak: „Összes", majd platformonként egy-egy fül (Webes találatok, Facebook, Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bíróságok, RSS stb.). A fül számlálója a valódi találatok száma (zöld), vagy ha csak keresőkártya van, a kártyák száma (szürke).
+
+## Keresés a böngészőben (aktuális működés)
+
+A korábbi „Keresési Futam" fül megszűnt; a keresés a **Böngésző** fülön történik, úgy, mint egy böngészőben:
+
+- A fül tetején a **Keresés minden platformon** mezőbe írt kifejezés minden bekapcsolt platformhoz külön **böngészőfület** nyit, a platform saját szintaxisára igazított lekérdezéssel: Google, Google Hírek, Bing, DuckDuckGo, Google Scholar, YouTube, Reddit, Facebook és X (domainre szűkített Google-keresésen át, így bejelentkezés nélkül is látszik), Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bíróságok, anonimizált határozatok (e-akta), Kúria jogegységi határozatok, Közbeszerzési Értesítő, valamint a bírósági keresőoldalak saját oldala.
+- A fülek **lustán töltődnek**: az első azonnal betölt, a többi akkor, amikor rákattintasz. A fül a platform nevét viseli.
+- A **Platformok** menüben kapcsolhatók ki a platformok; a választás megmarad.
+- Az **Archiválás** gomb az aktív fül *megjelenített* szövegét menti (azt, amit látsz, bejelentkezést kérő oldalon is), a hash-elt archívumba, a közzétételi/módosítási idővel, amennyiben az oldal jelzi. Az archiválás az aktuális keresési futamhoz kapcsolódik, így az Előzmények és az export is látja.
+- Minden keresés rögzítődik futamként (a megnyitott címekkel), és az audit napló is tartalmazza.
+- A Google hozzájárulási oldalát vagy captchát egyszer kell elfogadni/megoldani a böngészőfülön.

@@ -3671,6 +3671,19 @@ async fn browser_open_tab(
 
     let builder = tauri::webview::WebviewBuilder::new(&label, tauri::WebviewUrl::External(parsed))
         .on_navigation(move |target| {
+            // az élő oldal szövegének visszajuttatása (archiváláshoz): megszakított sentinel-navigáció
+            if target.host_str() == Some(scrape::SENTINEL_HOST) {
+                if let Some(fragment) = target.fragment() {
+                    let _ = nav_app.emit(
+                        "browser-page-text",
+                        serde_json::json!({
+                            "label": nav_label.clone(),
+                            "payload": ddg::percent_decode(fragment),
+                        }),
+                    );
+                }
+                return false;
+            }
             let allowed = target.scheme() == "http" || target.scheme() == "https";
             if allowed {
                 let _ = nav_app.emit(
@@ -3810,6 +3823,39 @@ async fn browser_action(app: tauri::AppHandle, tab_id: String, action: String) -
         _ => return Err("Ismeretlen böngészőművelet.".to_string()),
     };
     webview.eval(script).map_err(|e| e.to_string())
+}
+
+/// Kéri az aktív oldal megjelenített szövegét; az eredmény a `browser-page-text` eseményben érkezik.
+#[tauri::command]
+async fn browser_capture_text(app: tauri::AppHandle, tab_id: String) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    let webview = app
+        .get_webview(&label)
+        .ok_or_else(|| "A böngészőfül nem található.".to_string())?;
+    let script = r#"(function () {
+  function meta(names) {
+    for (var i = 0; i < names.length; i++) {
+      var el = document.querySelector('meta[property="' + names[i] + '"], meta[name="' + names[i] + '"], meta[itemprop="' + names[i] + '"]');
+      if (el && el.content) return el.content;
+    }
+    var t = document.querySelector("time[datetime]");
+    return names[0].indexOf("published") >= 0 && t ? t.getAttribute("datetime") : "";
+  }
+  var data = {
+    title: document.title || "",
+    url: location.href,
+    text: ((document.body && document.body.innerText) || "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").slice(0, 20000),
+    published: meta(["article:published_time", "datePublished", "og:published_time", "date"]),
+    modified: meta(["article:modified_time", "dateModified", "og:updated_time"]) || document.lastModified || ""
+  };
+  location.href = "https://irbr-scrape.invalid/#" + encodeURIComponent(JSON.stringify(data));
+})();"#;
+    webview.eval(script).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn browser_tab_links(query: String, enabled_platforms: Option<Vec<String>>) -> Vec<platforms::PlatformLink> {
+    platforms::tab_links(query.trim(), &enabled_platforms.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -4233,6 +4279,8 @@ pub fn run() {
             browser_navigate,
             browser_action,
             browser_close_tab,
+            browser_capture_text,
+            browser_tab_links,
             fetch_page_text,
             search_history,
             platform_links,

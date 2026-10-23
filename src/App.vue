@@ -6,12 +6,11 @@ import HelpTooltip from "./components/HelpTooltip.vue";
 import SourceReviewPanel from "./components/SourceReviewPanel.vue";
 import BrowserPanel from "./components/BrowserPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
-import { openTab as openBrowserTab } from "./browserStore.js";
+import { captureTab, closeSearchTabs, openTab as openBrowserTab } from "./browserStore.js";
 
 const allTabs = [
   { id: "demo", label: "Bemutató", advanced: true },
   { id: "cases", label: "Ügyek" },
-  { id: "search", label: "Keresési Futam" },
   { id: "browser", label: "Böngésző" },
   { id: "archive", label: "Archivum" },
   { id: "history", label: "Előzmények", advanced: true },
@@ -1486,7 +1485,7 @@ async function loadCases() {
   }
   if (!currentCase.value && loadedCases.length > 0) {
     currentCase.value = loadedCases[0];
-    currentTab.value = "search";
+    currentTab.value = "browser";
   }
 }
 
@@ -1539,7 +1538,7 @@ async function handleCreateCase() {
     newCaseDeadline.value = "";
     await loadCases();
     currentCase.value = cases.value.find((item) => item.id === newId) ?? cases.value[0] ?? null;
-    currentTab.value = "search";
+    currentTab.value = "browser";
   } catch (error) {
     appError.value = `Ügy létrehozási hiba: ${String(error)}`;
   }
@@ -1970,22 +1969,94 @@ async function openSearchPlanInBrowser() {
   }
 }
 
+const notice = ref("");
+
+async function runBrowserSearch(query) {
+  if (!currentCase.value) {
+    appError.value = "A kereséshez válassz vagy hozz létre egy ügyet.";
+    currentTab.value = "cases";
+    return;
+  }
+  appError.value = "";
+  notice.value = "";
+  rawQuery.value = query;
+  try {
+    const links = await api("browser_tab_links", { query, enabledPlatforms: enabledPlatforms.value });
+    if (links.length === 0) {
+      appError.value = "Nincs bekapcsolt platform. Kapcsolj be legalább egyet a Platformok menüben.";
+      return;
+    }
+    await closeSearchTabs();
+    activeSearchRunId.value = await api("record_search_run", {
+      caseId: currentCase.value.id,
+      summary: `Böngészős keresés: ${query}. Platformok: ${links.length}. Találatok: ${links.length}. Keresési terv-lépések: ${links.length}.`,
+      baseQuery: query,
+      engine: `böngésző | ${enabledPlatforms.value.length ? enabledPlatforms.value.join(", ") : "minden platform"}`,
+      tierFilter: 0,
+      planCount: links.length,
+      resultCount: links.length,
+      results: links.map((link) => ({
+        url: link.url,
+        title: link.label,
+        tier: 3,
+        source_type: "Böngészőfül",
+        query_used: query,
+        published_at: "",
+        evidence_level: "CONSTRUCTED",
+        story_id: 0,
+      })),
+      health: [],
+    });
+    for (let index = 0; index < links.length; index += 1) {
+      await openBrowserTab({
+        caseId: currentCase.value.id,
+        url: links[index].url,
+        title: links[index].label,
+        kind: "search",
+        lazy: index > 0,
+        activate: index === 0,
+      });
+    }
+    await Promise.all([loadAuditLogs(), loadSearchRuns()]);
+  } catch (error) {
+    appError.value = `A böngészős keresés nem indítható: ${String(error)}`;
+  }
+}
+
 async function archiveBrowserTab(tab) {
-  if (!tab) return;
-  await archiveResult({
-    title: tab.title || tab.url,
-    url: tab.url,
-    original_url: "",
-    archived_url: "",
-    archive_kind: "live",
-    snapshot_timestamp: "",
-    snippet: "Beépített böngészőből archivált oldal.",
-    tier: 3,
-    source_type: "Böngésző",
-    relevance: 100,
-    query_used: rawQuery.value || "",
-  });
-  await loadSources();
+  if (!tab || !currentCase.value) return;
+  notice.value = "";
+  try {
+    const page = await captureTab(tab.id);
+    const url = page.url || tab.url;
+    const title = page.title || tab.title || url;
+    const content = [
+      `Cím: ${title}`,
+      `URL: ${url}`,
+      `Fül: ${tab.kind === "search" ? tab.title : "kézzel megnyitott oldal"}`,
+      `Lekérdezés: ${rawQuery.value || ""}`,
+      "Forrás: beépített böngésző (az oldal megjelenített szövege, ahogy a felhasználó látta)",
+      page.published ? `Közzétéve (oldal jelzése): ${page.published}` : "",
+      "",
+      "--- Megjelenített oldaltartalom ---",
+      page.text || "(az oldalról nem olvasható ki szöveg)",
+    ].join("\n");
+    await api("archive_source", {
+      caseId: currentCase.value.id,
+      searchRunId: activeSearchRunId.value,
+      title,
+      url,
+      tier: 3,
+      publishedAt: page.published || null,
+      modifiedAt: page.modified || null,
+      timeSource: page.published || page.modified ? "meta" : null,
+      content,
+    });
+    await Promise.all([loadSources(), loadAuditLogs()]);
+    notice.value = `Archiválva: ${title}`;
+  } catch (error) {
+    appError.value = `Az oldal archiválása sikertelen: ${String(error)}`;
+  }
 }
 
 function isSearchEngineUrl(url) {
@@ -2208,6 +2279,10 @@ function tierBadgeClass(tier) {
         {{ appError }}
       </div>
 
+      <div v-if="notice" class="mb-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+        {{ notice }}
+      </div>
+
       <div v-if="searchWarning" class="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
         {{ searchWarning }}
       </div>
@@ -2348,7 +2423,7 @@ function tierBadgeClass(tier) {
 
                   <div class="flex shrink-0 gap-2">
                     <button
-                      @click="currentCase = item; currentTab = 'search'"
+                      @click="currentCase = item; currentTab = 'browser'"
                       class="rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-700"
                     >
                       Megnyitás
@@ -2396,764 +2471,14 @@ function tierBadgeClass(tier) {
           </aside>
         </section>
 
-        <section v-else-if="currentTab === 'search'" class="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
-          <div class="glass rounded-[28px] p-6">
-            <div class="flex items-start justify-between gap-4">
-              <div>
-                <div class="flex items-center gap-3">
-                  <h2 class="text-2xl font-semibold text-slate-950">Keresési futam</h2>
-                  <HelpTooltip text="Ebben a nézetben állítod össze a keresési feltételeket és indítod el a kutatási futamot. A rendszer priorizált megnyitási tervet ad a releváns forrásokhoz." />
-                </div>
-                <p class="mt-1 text-sm text-slate-600">
-                  Többlépcsős lekérdezésépítés, majd célzott nyitási lista a releváns forrástípusokra.
-                </p>
-              </div>
-              <button
-                @click="clearSearchForm"
-                class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-slate-300"
-              >
-                Űrlap törlése
-              </button>
-            </div>
-
-            <div class="mt-6 flex flex-wrap gap-2">
-              <button
-                v-for="preset in presets"
-                :key="preset.id"
-                @click="applyPreset(preset)"
-                class="rounded-full border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100"
-              >
-                {{ preset.label }}
-              </button>
-            </div>
-
-            <div v-if="!advanced" class="mt-6 grid gap-3">
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Mit keresel?</span>
-                <input
-                  v-model="rawQuery"
-                  @keydown.enter="runSearch"
-                  placeholder="pl. háztartási munka óradíj Budapest"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-slate-400"
-                />
-              </label>
-              <p class="text-xs leading-5 text-slate-500">
-                Írd be a témát, vagy válassz fent egy gyorsindítót. A rendszer több keresőn és hivatalos forráson futtatja. A pontos kifejezések, forráscsomagok és AI/API beállítások a Haladó módban érhetők el.
-              </p>
-              <div class="flex flex-wrap items-center gap-3">
-                <button
-                  @click="runSearch"
-                  :disabled="isSearching || !constructedQuery"
-                  class="rounded-2xl bg-sky-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-sky-600/20 transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {{ isSearching ? "Keresés..." : "Keresés indítása" }}
-                </button>
-                <button
-                  v-if="platformLinks.length"
-                  @click="openSearchPlanInBrowser"
-                  class="rounded-2xl border border-sky-200 bg-sky-50 px-5 py-3 text-sm font-semibold text-sky-700 transition hover:bg-sky-100"
-                >
-                  Megnyitás a böngészőben
-                </button>
-                <button @click="setUiMode('advanced')" class="text-xs font-semibold text-slate-500 underline-offset-2 hover:underline">
-                  Haladó beállítások…
-                </button>
-                <span v-if="isSearching" class="text-xs text-slate-500">
-                  A böngészős keresés platformonként fut, akár fél percig is tarthat.
-                </span>
-              </div>
-            </div>
-
-            <template v-if="advanced">
-            <div class="mt-6 grid gap-4 md:grid-cols-2">
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Kötelező kifejezések</span>
-                <input v-model="searchTerms.mustInclude" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Pontos kifejezés</span>
-                <input v-model="searchTerms.exactPhrase" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Alternatív fogalmak</span>
-                <input v-model="searchTerms.anyOf" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Kizárás</span>
-                <input v-model="searchTerms.exclude" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Cél domain</span>
-                <input v-model="searchTerms.site" placeholder="pl. ksh.hu" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Földrajzi fókusz</span>
-                <input v-model="searchTerms.region" placeholder="pl. Budapest vagy Hajdú-Bihar" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <div class="grid grid-cols-2 gap-3">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Évtől</span>
-                  <input v-model="searchTerms.yearFrom" inputmode="numeric" placeholder="2020" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-                </label>
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Évig</span>
-                  <input v-model="searchTerms.yearTo" inputmode="numeric" placeholder="2026" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-                </label>
-              </div>
-            </div>
-
-            <label class="mt-4 grid gap-1.5 text-sm">
-              <span class="font-semibold text-slate-700">Nyers lekérdezés felülbírálás</span>
-              <textarea v-model="rawQuery" rows="4" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 font-mono text-sm outline-none transition focus:border-slate-400"></textarea>
-            </label>
-
-            <div class="mt-5 grid gap-4">
-              <div class="grid gap-3">
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Keresési mód</div>
-                <div class="grid gap-3">
-                  <label
-                    v-for="mode in searchModes"
-                    :key="mode.id"
-                    :class="[
-                      'grid gap-1 rounded-2xl border px-4 py-3 transition',
-                      searchMode === mode.id ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700',
-                    ]"
-                  >
-                    <div class="flex items-center gap-3">
-                      <input v-model="searchMode" type="radio" :value="mode.id" class="accent-slate-900" />
-                      <span class="text-sm font-semibold">{{ mode.label }}</span>
-                    </div>
-                    <span :class="searchMode === mode.id ? 'text-slate-300' : 'text-slate-500'" class="text-xs leading-5">
-                      {{ mode.note }}
-                    </span>
-                  </label>
-                </div>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">AI kapcsolat</div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Hybrid vagy AI-only módnál helyben mentett API kulcsból dolgozik. A kulcs a portable adatbázisban marad ezen a gépen.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  AI beállítások mentése
-                </button>
-              </div>
-
-              <div class="mt-4 grid gap-4 lg:grid-cols-2">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Szolgáltató</span>
-                  <select v-model="aiSettings.ai_provider" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none">
-                    <option v-for="provider in aiProviders" :key="provider.id" :value="provider.id">
-                      {{ provider.label }}
-                    </option>
-                  </select>
-                </label>
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Modell</span>
-                  <input v-model="aiSettings.ai_model" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-                </label>
-              </div>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">API kulcs</span>
-                <input
-                  v-model="aiSettings.api_key"
-                  type="password"
-                  :placeholder="aiSettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'sk-... vagy a szolgáltató kulcsa'"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                />
-                <span v-if="aiSettings.api_key_set" class="text-xs text-slate-500">
-                  A mentett kulcs biztonsági okból nem jelenik meg. Üresen hagyva a korábbi kulcs marad érvényben.
-                </span>
-              </label>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">AI rendszerutasítás</span>
-                <textarea
-                  v-model="aiSettings.system_prompt"
-                  rows="4"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                ></textarea>
-              </label>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="aiConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-800'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ aiConfigured ? "API kulcs megadva" : "API kulcs nincs megadva" }}
-                </span>
-                <span v-if="settingsSaved" class="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 font-semibold uppercase tracking-[0.18em] text-sky-700">
-                  Mentve
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Google CSE – valódi találatok
-                    <HelpTooltip text="A Google Programmable Search Engine valódi Google találatokat (cím, URL, kivonat) ad vissza a keresési terv mellé. Natív és hibrid módban fut, tisztán AI módban nem. Az ingyenes keret napi 100 lekérdezés." />
-                  </div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Ha be van állítva, a natív és hibrid futamok valódi Google találatokkal egészülnek ki. Beállítás: hozz létre keresőt a programmablesearchengine.google.com oldalon (ez adja a cx azonosítót), és kérj Custom Search API kulcsot a Google Cloud Console-ban.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  CSE beállítások mentése
-                </button>
-              </div>
-
-              <div class="mt-4 grid gap-4 lg:grid-cols-2">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Search Engine ID (cx)</span>
-                  <input
-                    v-model="cseSettings.cx"
-                    placeholder="pl. a1b2c3d4e5f6g7h8i"
-                    class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                  />
-                </label>
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Custom Search API kulcs</span>
-                  <input
-                    v-model="cseSettings.api_key"
-                    type="password"
-                    :placeholder="cseSettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'AIza... kezdetű Google API kulcs'"
-                    class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                  />
-                </label>
-              </div>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="cseConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-600'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ cseConfigured ? "CSE aktív – valódi találatok" : "CSE nincs beállítva – csak keresési terv" }}
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Tavily – teljes webes találatok (ingyenes)
-                    <HelpTooltip text="A Tavily keresési API teljes webes valódi találatokat ad. Az ingyenes csomag havi 1000 lekérdezés, bankkártya nélkül, csak e-mailes regisztrációval. Natív és hibrid módban fut, tisztán AI módban nem." />
-                  </div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Teljes webes valódi találatok bankkártya nélkül: regisztrálj a tavily.com oldalon, és másold ide az API kulcsot (tvly-... kezdetű). Az ingyenes keret havi 1000 lekérdezés. A CSE-vel együtt is futhat, a találatok közösen rangsorolódnak.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  Tavily beállítások mentése
-                </button>
-              </div>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Tavily API kulcs</span>
-                <input
-                  v-model="tavilySettings.api_key"
-                  type="password"
-                  :placeholder="tavilySettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'tvly-... kezdetű Tavily API kulcs'"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                />
-              </label>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="tavilyConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-600'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ tavilyConfigured ? "Tavily aktív – teljes webes találatok" : "Tavily nincs beállítva" }}
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Brave Search – teljes webes találatok
-                    <HelpTooltip text="A Brave Search API saját, teljes webes indexből ad valódi találatokat. Fizetős előfizetés kell hozzá, ezért csak akkor érdemes beállítani, ha van Brave API előfizetésed. Natív és hibrid módban fut, tisztán AI módban nem." />
-                  </div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Teljes webes valódi találatok a Brave saját indexéből. Fizetős API (brave.com/search/api), ezért csak akkor töltsd ki, ha van előfizetésed – ingyenes alternatívaként a fenti Tavily ugyanezt tudja. A többi lekérdezővel együtt is futhat.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  Brave beállítások mentése
-                </button>
-              </div>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Brave Search API kulcs</span>
-                <input
-                  v-model="braveSettings.api_key"
-                  type="password"
-                  :placeholder="braveSettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'BSA... kezdetű Brave API kulcs'"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                />
-              </label>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="braveConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-600'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ braveConfigured ? "Brave aktív – teljes webes találatok" : "Brave nincs beállítva" }}
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-slate-950 px-4 py-4 text-sm text-slate-100">
-              <div class="flex items-center justify-between gap-3">
-                <div class="text-[11px] uppercase tracking-[0.18em] text-slate-400">Széles alaplekérdezés</div>
-                <div class="flex flex-wrap gap-2">
-                  <button
-                    @click="copyQueryToClipboard(broadQuery)"
-                    :disabled="!broadQuery"
-                    class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500 disabled:opacity-50"
-                  >
-                    Lekérdezés másolása
-                  </button>
-                  <button
-                    @click="openQueryInGoogle(broadQuery)"
-                    :disabled="!broadQuery"
-                    class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500 disabled:opacity-50"
-                  >
-                    Google-ben megnyitás
-                  </button>
-                </div>
-              </div>
-              <div class="mt-2 break-words font-mono text-[13px] leading-6">{{ broadQuery || "A lekérdezés itt jelenik meg." }}</div>
-              <div v-if="filteredQueries.length > 0" class="mt-4 border-t border-slate-800 pt-4">
-                <div class="text-[11px] uppercase tracking-[0.18em] text-slate-400">Szűrt szakértői lekérdezések ({{ filteredQueries.length }})</div>
-                <div v-for="item in filteredQueries" :key="item.label" class="mt-3">
-                  <div class="flex items-center justify-between gap-3">
-                    <div class="text-[11px] font-semibold text-slate-400">{{ item.label }}</div>
-                    <div class="flex flex-wrap gap-2">
-                      <button
-                        @click="copyQueryToClipboard(item.query)"
-                        class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500"
-                      >
-                        Másolás
-                      </button>
-                      <button
-                        @click="openQueryInGoogle(item.query)"
-                        class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500"
-                      >
-                        Google-ben
-                      </button>
-                    </div>
-                  </div>
-                  <div class="mt-1 break-words font-mono text-[12px] leading-6 text-slate-300">{{ item.query }}</div>
-                </div>
-              </div>
-              <div v-if="queryWordWarnings.length > 0" class="mt-4 rounded-2xl border border-amber-700/60 bg-amber-950/40 px-3 py-2 text-xs leading-5 text-amber-200">
-                <div class="font-semibold">Figyelem: a Google körülbelül 32 szóig veszi figyelembe a lekérdezést, a többletet levágja.</div>
-                <div v-for="warning in queryWordWarnings" :key="warning" class="mt-1">{{ warning }}</div>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex items-center justify-between gap-3">
-                <div>
-                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Platformok <HelpTooltip text="Minden keresés minden bekapcsolt platformon lefut, a platform saját szintaxisára igazított lekérdezéssel. Itt kapcsolhatsz ki platformot." /></div>
-                  <div class="mt-1 text-xs text-slate-500">{{ activePlatformCount }} / {{ platformList.length }} bekapcsolva. A valódi webes platformok keresésenként egy-egy API-hívást használnak.</div>
-                </div>
-                <div class="flex gap-2">
-                  <button
-                    v-if="platformLinks.length"
-                    @click="openSearchPlanInBrowser"
-                    class="rounded-full border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100"
-                  >
-                    Megnyitás a böngészőben
-                  </button>
-                  <button
-                    @click="searchPlanExpanded = !searchPlanExpanded"
-                    class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                  >
-                    {{ searchPlanExpanded ? "Elrejtés" : "Beállítás" }}
-                  </button>
-                </div>
-              </div>
-              <div v-if="searchPlanExpanded" class="mt-3 grid gap-2">
-                <label
-                  v-for="platform in platformList"
-                  :key="platform.id"
-                  class="flex items-start gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-2.5"
-                >
-                  <input type="checkbox" class="mt-1 accent-slate-900" :checked="isPlatformEnabled(platform.id)" @change="togglePlatform(platform.id)" />
-                  <span class="min-w-0">
-                    <span class="text-sm font-semibold text-slate-900">{{ platform.label }}</span>
-                    <span class="ml-2 text-[11px] uppercase tracking-[0.12em] text-slate-500">{{ platform.kind }}</span>
-                    <span v-if="platformQuery(platform.id)" class="mt-1 block break-words font-mono text-[11px] leading-5 text-slate-500">{{ platformQuery(platform.id) }}</span>
-                  </span>
-                </label>
-              </div>
-              <div v-else class="mt-3 text-xs text-slate-500">
-                Minden platform be van kapcsolva, hacsak itt másképp nem állítod. A lekérdezés mindenhol a platform saját szintaxisára alakul.
-              </div>
-            </div>
-
-            <div class="mt-5 grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
-              <div class="grid gap-3">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Tier szűrő</span>
-                  <select v-model="selectedTierFilter" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none">
-                    <option v-for="option in tierOptions" :key="option.value" :value="option.value">
-                      {{ option.label }}
-                    </option>
-                  </select>
-                </label>
-                <button
-                  @click="runSearch"
-                  :disabled="isSearching || !constructedQuery"
-                  class="rounded-2xl bg-sky-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-sky-600/20 transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {{ isSearching ? "Futam készül..." : "Keresési futam generálása" }}
-                </button>
-              </div>
-            </div>
-            </template>
-          </div>
-
-          <div class="glass rounded-[28px] p-6">
-            <div class="flex items-start justify-between gap-4">
-              <div>
-                <div class="flex items-center gap-3">
-                  <h2 class="text-2xl font-semibold text-slate-950">Ajánlott nyitások</h2>
-                  <HelpTooltip text="Itt jelenik meg a keresésből képzett megnyitási terv. A találatok innen nyithatók meg vagy archiválhatók további értékeléshez." />
-                </div>
-                <p class="mt-1 text-sm text-slate-600">
-                  Itt nem kész találatlista van, hanem priorizált megnyitási terv. Minden kártya megnyitható vagy archiválható.
-                </p>
-              </div>
-              <div class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600">
-                {{ searchResults.length }} elem
-              </div>
-            </div>
-
-            <div v-if="lastSearchSummary" class="mt-4 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-xs text-slate-600">
-              {{ lastSearchSummary }}
-            </div>
-
-            <div v-if="searchDiagnostics" class="mt-3 flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50/90 px-4 py-3 text-xs text-slate-600">
-              <span>
-                Generált kártyák: <span class="font-semibold text-slate-900">{{ searchDiagnostics.generated }}</span>,
-                megjelenítve: <span class="font-semibold text-slate-900">{{ searchDiagnostics.kept }}</span><template v-if="searchDiagnostics.filteredOut > 0">,
-                Tier-szűrő által elrejtve: <span class="font-semibold text-amber-700">{{ searchDiagnostics.filteredOut }}</span></template>.
-              </span>
-              <button
-                v-if="searchDiagnostics.filteredOut > 0 && selectedTierFilter !== 0"
-                @click="resetTierFilterAndRerun"
-                :disabled="isSearching"
-                class="rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-800 transition hover:bg-amber-100 disabled:opacity-60"
-              >
-                Tier-szűrő nullázása és újrafuttatás
-              </button>
-            </div>
-
-            <div v-if="searchRuns.length > 0" class="mt-4 rounded-3xl border border-slate-200 bg-slate-50/90 p-4">
-              <div class="flex items-center justify-between gap-4">
-                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Korábbi futamok ugyanebben az ügyben</div>
-                <div class="text-[11px] text-slate-500">2 futam kijelölése esetén gyors összevetés jelenik meg</div>
-              </div>
-
-              <div v-if="selectedRunComparison.length === 2" class="mt-3 rounded-2xl border border-slate-200 bg-white px-4 py-3">
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Futam összevetés</div>
-                <div class="mt-3 grid gap-3 lg:grid-cols-2">
-                  <article
-                    v-for="run in selectedRunComparison"
-                    :key="run.id"
-                    class="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3"
-                  >
-                    <div class="text-sm font-semibold text-slate-900">{{ run.created_at }}</div>
-                    <div class="mt-1 text-xs text-slate-600">{{ run.summary }}</div>
-                    <button
-                      @click="toggleRunExpanded(run.id)"
-                      class="mt-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-700 transition hover:border-slate-300"
-                    >
-                      {{ isRunExpanded(run.id) ? "Részletek elrejtése" : "Részletek" }}
-                    </button>
-                    <div v-if="isRunExpanded(run.id)" class="mt-2 rounded-2xl border border-slate-200 bg-white px-3 py-3">
-                      <div class="break-words font-mono text-[11px] leading-5 text-slate-500">{{ run.base_query }}</div>
-                    </div>
-                    <div v-if="run.note?.trim()" class="mt-2 text-xs leading-5 text-slate-600">
-                      Megjegyzés: {{ run.note }}
-                    </div>
-                  </article>
-                </div>
-              </div>
-
-              <div class="mt-3 grid gap-2">
-                <article
-                  v-for="run in searchRuns.slice(0, 5)"
-                  :key="run.id"
-                  class="rounded-2xl border border-slate-200 bg-white px-3 py-3"
-                >
-                  <div class="flex flex-col gap-3">
-                    <div class="flex flex-col gap-1 lg:flex-row lg:items-start lg:justify-between">
-                      <div class="min-w-0">
-                        <div class="text-sm font-semibold text-slate-900">{{ run.summary }}</div>
-                        <div class="mt-1 text-xs text-slate-500">{{ run.result_count }} találat | {{ run.engine }}</div>
-                      </div>
-                      <div class="shrink-0 text-xs text-slate-500">{{ run.created_at }}</div>
-                    </div>
-
-                    <div class="flex flex-wrap gap-2">
-                      <button
-                        @click="applySearchRun(run)"
-                        class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      >
-                        Betöltés
-                      </button>
-                      <button
-                        @click="rerunSearchRun(run)"
-                        class="rounded-full bg-slate-900 px-3 py-2 text-xs font-semibold text-white transition hover:bg-slate-700"
-                      >
-                        Újrafuttatás
-                      </button>
-                      <button
-                        @click="toggleRunComparison(run.id)"
-                        :class="[
-                          'rounded-full border px-3 py-2 text-xs font-semibold transition',
-                          selectedRunIds.includes(run.id)
-                            ? 'border-sky-700 bg-sky-700 text-white'
-                            : 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100',
-                        ]"
-                      >
-                        {{ selectedRunIds.includes(run.id) ? "Kijelölve" : "Összevetéshez" }}
-                      </button>
-                      <button
-                        @click="toggleRunExpanded(run.id)"
-                        class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      >
-                        {{ isRunExpanded(run.id) ? "Részletek elrejtése" : "Részletek" }}
-                      </button>
-                    </div>
-
-                    <div v-if="isRunExpanded(run.id)" class="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                      <div>
-                        <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Teljes lekérdezés</div>
-                        <div class="mt-2 break-words font-mono text-[11px] leading-5 text-slate-500">{{ run.base_query }}</div>
-                      </div>
-                      <div class="grid gap-2 rounded-2xl border border-slate-200 bg-white p-3">
-                        <label class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                          Szakértői megjegyzés
-                        </label>
-                        <textarea
-                          v-model="runNoteDrafts[run.id]"
-                          rows="3"
-                          class="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-700 outline-none"
-                          placeholder="Rövid megjegyzés a futam eredményéről, hiányairól vagy következő lépéséről."
-                        ></textarea>
-                        <div class="flex items-center justify-between gap-3">
-                          <div class="text-[11px] text-slate-500">
-                            {{ run.note?.trim() ? "Van mentett megjegyzés." : "Még nincs mentett megjegyzés." }}
-                          </div>
-                          <button
-                            @click="saveRunNote(run)"
-                            class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                          >
-                            Megjegyzés mentése
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </article>
-              </div>
-            </div>
-
-            <div v-if="searchResults.length" class="mt-5 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
-              <strong>{{ realHitCount }}</strong> valódi találat · <strong>{{ cardCount }}</strong> keresőkártya
-              <span class="text-slate-500">(a kártyák a platform saját keresőjét nyitják meg, a lekérdezéssel kitöltve)</span>
-            </div>
-            <div
-              v-if="searchResults.length && realHitCount === 0"
-              class="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
-            >
-              Nem érkezett valódi webes találat. Ilyenkor csak a keresőkártyák állnak rendelkezésre.
-              <span v-if="ddgEntry?.state === 'hiba'">{{ ddgEntry.error }}</span>
-              <span v-else>Állíts be egy ingyenes Tavily-kulcsot (Haladó mód, Keresési futam) a megbízható, platformonkénti találatokhoz.</span>
-            </div>
-            <div
-              v-else-if="ddgEntry?.state === 'ok'"
-              class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900"
-            >
-              A valódi találatok a beépített böngészőből jönnek (Google, ennek ellenőrzése esetén Bing), kulcs nélkül. Lassabb, mint az API; ingyenes Tavily-kulccsal gyorsabb és megbízhatóbb.
-            </div>
-
-            <div v-if="activeHealth.length" class="mt-3 flex flex-wrap items-center gap-2">
-              <span class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Források</span>
-              <span
-                v-for="entry in activeHealth"
-                :key="entry.id"
-                :class="healthClass(entry.state)"
-                class="rounded-full border px-2.5 py-1 text-[11px] font-semibold"
-                :title="entry.error || `${entry.state}, ${entry.ms} ms`"
-              >
-                {{ entry.label }}: {{ entry.state }}{{ entry.state === 'ok' ? ` (${entry.count})` : '' }}
-              </span>
-              <span v-if="inactiveHealthCount" class="text-[11px] text-slate-400">+ {{ inactiveHealthCount }} kikapcsolt vagy kihagyott</span>
-            </div>
-
-            <div v-if="resultTabs.length > 2" class="mt-5 flex flex-wrap items-end gap-1 border-b border-slate-200">
-              <button
-                v-for="tab in resultTabs"
-                :key="tab.id"
-                @click="resultTab = tab.id"
-                :class="[
-                  'flex items-center gap-2 rounded-t-xl border border-b-0 px-3 py-2 text-xs font-semibold transition',
-                  resultTab === tab.id
-                    ? 'border-slate-300 bg-white text-slate-900'
-                    : 'border-transparent bg-slate-100 text-slate-600 hover:bg-slate-200/70',
-                ]"
-                :title="`${tab.real} valódi találat, ${tab.total - tab.real} keresőkártya`"
-              >
-                <span>{{ tab.label }}</span>
-                <span
-                  :class="tab.real > 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-500'"
-                  class="rounded-full px-1.5 py-0.5 text-[10px]"
-                >{{ tab.real > 0 ? tab.real : tab.total }}</span>
-              </button>
-            </div>
-
-            <div v-if="runDelta" class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
-              Az előző azonos keresési futamhoz képest:
-              <strong>{{ runDelta.new_total }} új</strong>,
-              <strong>{{ runDelta.dropped_total }} kiesett</strong>,
-              {{ runDelta.kept_count }} változatlan találat.
-              <span v-if="runDelta.tier_changes.length">{{ runDelta.tier_changes.length }} találat tier-je változott.</span>
-              <button v-if="advanced" @click="currentTab = 'history'" class="ml-2 font-semibold underline">Részletek</button>
-            </div>
-
-            <div class="mt-5 grid gap-4">
-              <article
-                v-for="result in visibleResults"
-                :key="getSearchResultKey(result)"
-                class="rounded-3xl border border-slate-200 bg-white/90 p-5 shadow-sm"
-              >
-                <div class="flex flex-col gap-4">
-                  <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                    <div class="min-w-0">
-                      <div class="flex flex-wrap items-center gap-2">
-                        <span :class="tierBadgeClass(result.tier)" class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]">
-                          Tier {{ result.tier }}
-                        </span>
-                        <span class="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-600">
-                          {{ result.source_type }}
-                        </span>
-                        <span
-                          :class="isWaybackResult(result) ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'"
-                          class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]"
-                        >
-                          {{ formatArchiveKind(result.archive_kind) }}
-                        </span>
-                        <span class="text-xs font-semibold text-slate-500">Relevancia: {{ result.relevance }}</span>
-                        <span
-                          v-if="result.freshness"
-                          :class="freshnessClass(result.freshness)"
-                          class="rounded-full border px-2.5 py-1 text-[11px] font-semibold"
-                          :title="result.published_at ? `Közzétéve: ${result.published_at}` : 'A szolgáltató nem adott közzétételi időt.'"
-                        >
-                          {{ result.published_at ? `${formatDay(result.published_at)} · ${result.freshness}` : "idő ismeretlen" }}
-                        </span>
-                        <button
-                          v-if="result.story_size > 1"
-                          @click="toggleStory(result)"
-                          class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-[11px] font-semibold text-violet-700 hover:bg-violet-100"
-                          title="Ugyanarról a témáról szóló találatok"
-                        >
-                          {{ hiddenInStory(result) > 0 ? `+${hiddenInStory(result)} hasonló találat` : "Hasonlók elrejtése" }}
-                        </button>
-                      </div>
-                      <h3 class="mt-3 text-lg font-semibold text-slate-900">{{ result.title }}</h3>
-                      <p class="mt-2 text-sm leading-6 text-slate-600">{{ result.snippet }}</p>
-                    </div>
-
-                    <div class="flex shrink-0 flex-wrap gap-2">
-                      <button
-                        @click="openSearchResult(result)"
-                        class="rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-700"
-                      >
-                        {{ result.action_label }}
-                      </button>
-                      <button
-                        @click="openResultInViewer(result)"
-                        class="rounded-full border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400"
-                      >
-                        Böngészőben
-                      </button>
-                      <button
-                        @click="archiveResult(result)"
-                        :disabled="busyArchiveId === `${result.url}|current`"
-                        class="rounded-full border border-sky-200 bg-sky-50 px-4 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-60"
-                      >
-                        {{ busyArchiveId === `${result.url}|current` ? "Archiválás..." : "Aktuális nézet archiválása" }}
-                      </button>
-                      <button
-                        v-if="isWaybackResult(result) && result.original_url"
-                        @click="archiveResultVariant(result, 'original')"
-                        :disabled="busyArchiveId === `${result.url}|original`"
-                        class="rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-60"
-                      >
-                        {{ busyArchiveId === `${result.url}|original` ? "Archiválás..." : "Élő URL archiválása" }}
-                      </button>
-                      <button
-                        @click="toggleResultExpanded(result)"
-                        class="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      >
-                        {{ isResultExpanded(result) ? "Részletek elrejtése" : "Részletek" }}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div class="break-all text-xs text-sky-700">{{ result.url }}</div>
-                  <div v-if="isResultExpanded(result)" class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                    <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Keresési részletek</div>
-                    <p class="mt-3 break-words font-mono text-[12px] leading-6 text-slate-600">{{ result.query_used }}</p>
-                    <p v-if="result.original_url && result.original_url !== result.url" class="mt-3 break-all text-xs text-slate-500">
-                      Eredeti URL: {{ result.original_url }}
-                    </p>
-                    <p v-if="result.snapshot_timestamp" class="mt-1 text-xs text-slate-500">
-                      Snapshot: {{ result.snapshot_timestamp }}
-                    </p>
-                  </div>
-                </div>
-              </article>
-
-              <div v-if="searchResults.length === 0" class="rounded-3xl border border-dashed border-slate-300 bg-white/70 p-10 text-center text-sm text-slate-500">
-                Még nincs keresési futam. Állítsd össze a lekérdezést és indítsd el.
-              </div>
-            </div>
-          </div>
-        </section>
-
         <section v-else-if="currentTab === 'browser'">
           <BrowserPanel
             :case-id="currentCase?.id ?? null"
-            :suggestions="browserPlanSuggestions"
+            :platforms="platformList"
+            :enabled-ids="enabledPlatforms"
+            :initial-query="rawQuery"
+            @search="runBrowserSearch"
+            @toggle-platform="togglePlatform"
             @open-url="openInBrowserPanel"
             @archive="archiveBrowserTab"
             @error="(message) => (appError = message)"

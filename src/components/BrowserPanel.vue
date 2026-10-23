@@ -13,13 +13,24 @@ import {
 
 const props = defineProps({
   caseId: { type: Number, default: null },
+  platforms: { type: Array, default: () => [] },
+  enabledIds: { type: Array, default: () => [] },
+  initialQuery: { type: String, default: "" },
   // Üres panelnél ide kerülnek a javasolt indítóoldalak (pl. a keresési terv lépései).
   suggestions: { type: Array, default: () => [] },
 });
-const emit = defineEmits(["open-url", "archive", "error"]);
+const emit = defineEmits(["open-url", "archive", "error", "search", "toggle-platform"]);
 
 const viewport = ref(null);
 const addressInput = ref("");
+const searchInput = ref(props.initialQuery);
+const platformsOpen = ref(false);
+const isEnabled = (id) => props.enabledIds.length === 0 || props.enabledIds.includes(id);
+const enabledCount = computed(() => props.platforms.filter((p) => isEnabled(p.id)).length);
+function submitSearch() {
+  const query = searchInput.value.trim();
+  if (query) emit("search", query);
+}
 const addressEl = ref(null);
 const focused = ref(false);
 let observer = null;
@@ -141,15 +152,38 @@ async function run(action) {
 
 <template>
   <div class="overflow-hidden rounded-2xl border border-slate-300 bg-slate-100 shadow-lg">
+    <!-- Keresés minden platformon -->
+    <div class="relative flex flex-wrap items-center gap-2 border-b border-slate-200 bg-slate-50 px-3 py-2">
+      <input
+        v-model="searchInput"
+        @keydown.enter="submitSearch"
+        placeholder="Keresés minden platformon (pl. takarítás eger órabér)"
+        class="min-w-[240px] flex-1 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm outline-none focus:border-slate-400"
+      />
+      <button @click="submitSearch" :disabled="!searchInput.trim()" class="rounded-full bg-sky-600 px-5 py-2 text-sm font-semibold text-white transition hover:bg-sky-500 disabled:opacity-50">
+        Keresés
+      </button>
+      <button @click="platformsOpen = !platformsOpen" class="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 hover:border-slate-300">
+        Platformok ({{ enabledCount }}/{{ platforms.length }}) ▾
+      </button>
+      <div v-if="platformsOpen" class="absolute right-3 top-full z-20 mt-1 grid max-h-80 w-80 gap-1 overflow-auto rounded-2xl border border-slate-200 bg-white p-3 shadow-xl">
+        <label v-for="platform in platforms" :key="platform.id" class="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1 text-xs hover:bg-slate-50">
+          <input type="checkbox" class="accent-slate-900" :checked="isEnabled(platform.id)" @change="emit('toggle-platform', platform.id)" />
+          <span class="font-semibold text-slate-800">{{ platform.label }}</span>
+          <span class="ml-auto text-[10px] uppercase tracking-wide text-slate-400">{{ platform.kind }}</span>
+        </label>
+      </div>
+    </div>
+
     <!-- Fülsáv -->
-    <div class="flex items-end gap-1 bg-slate-200 px-2 pt-2">
+    <div class="flex items-end gap-1 overflow-x-auto bg-slate-200 px-2 pt-2">
       <div
         v-for="tab in browser.tabs"
         :key="tab.id"
         @click="activateTab(tab.id)"
         @auxclick.middle.prevent="closeTab(tab.id)"
         :class="[
-          'group relative flex h-9 min-w-[110px] max-w-[220px] flex-1 cursor-default items-center gap-2 rounded-t-xl px-3 text-xs transition',
+          'group relative flex h-9 min-w-[120px] max-w-[220px] shrink-0 flex-1 cursor-default items-center gap-2 rounded-t-xl px-3 text-xs transition',
           tab.id === browser.activeId
             ? 'bg-white text-slate-900 shadow-[0_-1px_0_rgba(0,0,0,0.06)]'
             : 'text-slate-600 hover:bg-slate-100/80',
@@ -222,7 +256,7 @@ async function run(action) {
     <div ref="viewport" class="relative h-[72vh] min-h-[440px] bg-white">
       <div v-if="!activeTab" class="flex h-full flex-col items-center justify-center gap-4 p-6 text-center">
         <div class="text-lg font-semibold text-slate-700">IRBR böngésző</div>
-        <div class="max-w-md text-sm text-slate-500">Nyiss meg egy találatot a „Böngészőben" gombbal, írj címet a sávba, vagy indíts a keresési terv lépéseivel.</div>
+        <div class="max-w-md text-sm text-slate-500">Írj be egy keresést fent: minden platformhoz (Google, Facebook, Magyar Közlöny, Nemzeti Jogszabálytár, bíróságok stb.) külön fül nyílik a találataival.</div>
         <div v-if="suggestions.length" class="flex max-w-2xl flex-wrap justify-center gap-2">
           <button
             v-for="item in suggestions"

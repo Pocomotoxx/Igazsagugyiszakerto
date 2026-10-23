@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::Manager;
 
-const SENTINEL_HOST: &str = "irbr-scrape.invalid";
+pub const SENTINEL_HOST: &str = "irbr-scrape.invalid";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const GAP: Duration = Duration::from_millis(1200);
 const MAX_HITS: usize = 15;
