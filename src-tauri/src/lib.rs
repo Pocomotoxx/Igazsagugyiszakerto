@@ -111,6 +111,9 @@ pub struct SearchResult {
     pub story_id: i64,
     #[serde(default)]
     pub story_size: i32,
+    /// A találat platformja (pl. "facebook", "magyar_kozlony", "hu_rss", "web", "ai", "egyeb").
+    #[serde(default)]
+    pub platform: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -801,6 +804,7 @@ fn push_result(
             freshness: String::new(),
             story_id: 0,
             story_size: 0,
+            platform: String::new(),
         });
     }
 }
@@ -867,6 +871,15 @@ fn finalize_results(results: &mut [SearchResult]) {
     for (position, &index) in retrieved.iter().enumerate() {
         results[index].story_id = ids[position] as i64 + 1;
         results[index].story_size = sizes[&ids[position]];
+    }
+}
+
+/// A `from` indextől a végéig beállítja a platformot azokra a találatokra, amelyeknek még nincs.
+fn tag_platform(results: &mut [SearchResult], from: usize, platform: &str) {
+    for result in results.iter_mut().skip(from) {
+        if result.platform.is_empty() {
+            result.platform = platform.to_string();
+        }
     }
 }
 
@@ -1762,6 +1775,7 @@ fn run_site_search(
     };
     for (index, result) in local.iter_mut().enumerate() {
         result.source_type = platform.label.to_string();
+        result.platform = platform.id.to_string();
         result.tier = platform.tier;
         result.relevance = (platform.relevance - (index as i32) * 2).max(55);
         // a platform saját útvonalán belüli találat előrébb kerül
@@ -1797,6 +1811,7 @@ fn add_rss_results(
         );
         if let Some(last) = results.last_mut() {
             last.source_type = format!("Hírforrás: {}", item.feed);
+            last.platform = "hu_rss".to_string();
             last.published_at = item.published_at.clone();
         }
     }
@@ -1831,6 +1846,7 @@ fn push_hits(
         );
         if let (Some(platform), Some(last)) = (platform, results.last_mut()) {
             last.source_type = platform.label.to_string();
+            last.platform = platform.id.to_string();
             last.tier = platform.tier;
             last.relevance = (platform.relevance - (index as i32) * 2).max(55);
             if !platform.path.is_empty() && last.url.contains(platform.path) {
@@ -1960,6 +1976,7 @@ fn add_platform_cards(
         if platform.id == "google" {
             continue;
         }
+        let platform_start = results.len();
         if let Some(url) = platforms::native_url(platform.native, original, parsed) {
             push_detected_result(
                 results,
@@ -2018,6 +2035,7 @@ fn add_platform_cards(
                 "Megnyitás",
             );
         }
+        tag_platform(results, platform_start, platform.id);
     }
 }
 
@@ -3042,10 +3060,13 @@ fn execute_search_blocking(
         let parsed_query = platforms::parse_query(trimmed);
         if platforms::enabled(enabled_platforms, "google") {
             add_engine_launchers(&mut results, 0, "google", trimmed);
+            tag_platform(&mut results, constructed_start, "google");
         }
         add_platform_cards(&mut results, trimmed, &parsed_query, enabled_platforms);
+        let curated_start = results.len();
         add_curated_sources(&mut results, 0, trimmed, selected_source_packs);
         add_domain_specific_sources(&mut results, 0, trimmed, selected_source_packs);
+        tag_platform(&mut results, curated_start, "egyeb");
         tag_evidence(&mut results, constructed_start, "CONSTRUCTED");
         health.push(ProviderHealth {
             id: "native".into(),
@@ -3286,6 +3307,7 @@ fn execute_search_blocking(
             }
         }
         health.extend(platform_health);
+        tag_platform(&mut results, retrieved_start, "web");
         tag_evidence(&mut results, retrieved_start, "RETRIEVED");
     }
 
@@ -3349,6 +3371,7 @@ fn execute_search_blocking(
             );
         }
     }
+    tag_platform(&mut results, suggested_start, "ai");
     tag_evidence(&mut results, suggested_start, "SUGGESTED");
 
     let generated_count = results.len() as i32;
@@ -4434,6 +4457,9 @@ mod tests {
         let parsed = platforms::parse_query(original);
         add_platform_cards(&mut results, original, &parsed, &[]);
         let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
+        assert!(results.iter().all(|r| !r.platform.is_empty()));
+        assert!(results.iter().any(|r| r.platform == "facebook" && r.url.contains("facebook.com/search/posts")));
+        assert!(results.iter().any(|r| r.platform == "magyar_kozlony"));
         assert!(urls.iter().any(|u| u.contains("facebook.com/search/posts")));
         assert!(urls.iter().any(|u| u.contains("reddit.com/search")));
         assert!(urls.iter().any(|u| u.contains("x.com/search") && u.contains("since%3A2020")));

@@ -96,3 +96,7 @@ Ha nincs beállítva Tavily, Brave vagy Google CSE kulcs, az alkalmazás a beép
 
 - **Első indításkor** a Google hozzájárulási oldala megjelenhet; a szkript elfogadja. Ha a Google captchát kér, a futam hátralévő része Bingen fut, és a „Források" sorban hiba látszik. Ilyenkor a Böngésző fülön nyisd meg a Google-t, és oldd meg egyszer az ellenőrzést: a böngészőpanel és a keresőablak közös profilt használ.
 - A böngészős keresés lassabb az API-nál (platformonként néhány másodperc), és a találatok a Google aktuális oldalszerkezetétől függnek. Ha a Google átalakítja az oldalt, a kiolvasó szkriptet (`src-tauri/src/scrape.rs`) kell frissíteni. Tartós használathoz egy ingyenes Tavily-kulcs gyorsabb és stabilabb.
+
+### Eredmények platformonként (fülek)
+
+A keresési találatok a lista fölötti fülekre oszlanak: „Összes", majd platformonként egy-egy fül (Webes találatok, Facebook, Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bíróságok, RSS stb.). A fül számlálója a valódi találatok száma (zöld), vagy ha csak keresőkártya van, a kártyák száma (szürke).

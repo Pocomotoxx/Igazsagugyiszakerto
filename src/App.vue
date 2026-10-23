@@ -195,9 +195,34 @@ const activeHealth = computed(() => searchHealth.value.filter((e) => e.state ===
 const inactiveHealthCount = computed(() => searchHealth.value.length - activeHealth.value.length);
 const ddgEntry = computed(() => searchHealth.value.find((e) => e.id === "browser" || e.id === "ddg"));
 
+const resultTab = ref("all");
+const EXTRA_TAB_LABELS = { web: "Webes találatok", ai: "AI javaslatok", egyeb: "További források" };
+const platformKey = (item) => item.platform || "egyeb";
+
+const resultTabs = computed(() => {
+  const counts = new Map();
+  searchResults.value.forEach((item) => {
+    const key = platformKey(item);
+    const entry = counts.get(key) || { total: 0, real: 0 };
+    entry.total += 1;
+    if (item.evidence_level === "RETRIEVED") entry.real += 1;
+    counts.set(key, entry);
+  });
+  const order = ["web", ...platformList.value.map((p) => p.id), "egyeb", "ai"];
+  const labelOf = (id) => platformList.value.find((p) => p.id === id)?.label || EXTRA_TAB_LABELS[id] || id;
+  const tabs = order
+    .filter((id, index) => counts.has(id) && order.indexOf(id) === index)
+    .map((id) => ({ id, label: labelOf(id), ...counts.get(id) }));
+  const real = searchResults.value.filter((item) => item.evidence_level === "RETRIEVED").length;
+  return [{ id: "all", label: "Összes", total: searchResults.value.length, real }, ...tabs];
+});
+
 const visibleResults = computed(() => {
   const seen = new Set();
-  return searchResults.value.filter((result) => {
+  const inTab = searchResults.value.filter(
+    (item) => resultTab.value === "all" || platformKey(item) === resultTab.value,
+  );
+  return inTab.filter((result) => {
     if (!result.story_id || result.story_size < 2) return true;
     if (expandedStories.value[result.story_id]) return true;
     if (seen.has(result.story_id)) return false;
@@ -1745,6 +1770,7 @@ async function runSearch() {
   searchWarning.value = "";
   searchDiagnostics.value = null;
   runDelta.value = null;
+  resultTab.value = "all";
   expandedStories.value = {};
   expandedResultKeys.value = {};
 
@@ -2990,6 +3016,27 @@ function tierBadgeClass(tier) {
                 {{ entry.label }}: {{ entry.state }}{{ entry.state === 'ok' ? ` (${entry.count})` : '' }}
               </span>
               <span v-if="inactiveHealthCount" class="text-[11px] text-slate-400">+ {{ inactiveHealthCount }} kikapcsolt vagy kihagyott</span>
+            </div>
+
+            <div v-if="resultTabs.length > 2" class="mt-5 flex flex-wrap items-end gap-1 border-b border-slate-200">
+              <button
+                v-for="tab in resultTabs"
+                :key="tab.id"
+                @click="resultTab = tab.id"
+                :class="[
+                  'flex items-center gap-2 rounded-t-xl border border-b-0 px-3 py-2 text-xs font-semibold transition',
+                  resultTab === tab.id
+                    ? 'border-slate-300 bg-white text-slate-900'
+                    : 'border-transparent bg-slate-100 text-slate-600 hover:bg-slate-200/70',
+                ]"
+                :title="`${tab.real} valódi találat, ${tab.total - tab.real} keresőkártya`"
+              >
+                <span>{{ tab.label }}</span>
+                <span
+                  :class="tab.real > 0 ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-200 text-slate-500'"
+                  class="rounded-full px-1.5 py-0.5 text-[10px]"
+                >{{ tab.real > 0 ? tab.real : tab.total }}</span>
+              </button>
             </div>
 
             <div v-if="runDelta" class="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
