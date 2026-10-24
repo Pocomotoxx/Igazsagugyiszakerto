@@ -11,6 +11,14 @@ export default defineConfig(async () => ({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // két belépési pont: az asztali alkalmazás (index.html) és az önálló, PWA-ként telepíthető
+    // Gyógyszer-ellenőrzés (medication.html)
+    rollupOptions: {
+      input: {
+        main: "index.html",
+        medication: "medication.html",
+      },
+    },
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
