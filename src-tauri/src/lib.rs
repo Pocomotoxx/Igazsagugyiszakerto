@@ -9,7 +9,6 @@ use tauri::{Emitter, Manager};
 
 mod export;
 mod history;
-mod medication;
 mod platforms;
 mod provenance;
 mod story;
@@ -1105,16 +1104,21 @@ fn parse_browser_url(url: &str) -> Result<tauri::Url, String> {
     Ok(parsed)
 }
 
-/// Új böngészőfül (a főablak gyermek-webviewja) létrehozása a megadott célra.
-fn spawn_tab(
-    app: &tauri::AppHandle,
-    label: String,
-    target: tauri::WebviewUrl,
+#[tauri::command]
+async fn browser_open_tab(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    tab_id: String,
+    url: String,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
 ) -> Result<(), String> {
+    let label = browser_label(&tab_id)?;
+    let parsed = parse_browser_url(&url)?;
+
     if app.get_webview(&label).is_some() {
         return Err("Ez a böngészőfül már létezik.".to_string());
     }
@@ -1132,7 +1136,7 @@ fn spawn_tab(
     let title_app = app.clone();
     let title_label = label.clone();
 
-    let builder = tauri::webview::WebviewBuilder::new(&label, target)
+    let builder = tauri::webview::WebviewBuilder::new(&label, tauri::WebviewUrl::External(parsed))
         .on_navigation(move |target| {
             // az élő oldal szövegének visszajuttatása (archiváláshoz): megszakított sentinel-navigáció
             if target.host_str() == Some(SENTINEL_HOST) {
@@ -1147,7 +1151,7 @@ fn spawn_tab(
                 }
                 return false;
             }
-            let allowed = target.scheme() == "http" || target.scheme() == "https" || target.scheme() == "tauri";
+            let allowed = target.scheme() == "http" || target.scheme() == "https";
             if allowed {
                 let _ = nav_app.emit(
                     "browser-nav",
@@ -1188,65 +1192,16 @@ fn spawn_tab(
             tauri::LogicalSize::new(width.max(1.0), height.max(1.0)),
         )
         .map_err(|e| format!("A böngészőfül megnyitása sikertelen: {e}"))?;
+
+    log_action(
+        &state.db_path,
+        case_id,
+        "browser_tab_opened",
+        &url,
+        "Oldal megnyitva a beépített böngészőben.",
+    )?;
+
     Ok(())
-}
-
-/// `case_id` nélkül (pl. a Gyógyszer-ellenőrzésből) nem kerül auditnaplóba semmi: a keresett
-/// gyógyszernév egészségügyi adat, ezt a program nem tárolja.
-#[tauri::command]
-async fn browser_open_tab(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, DbState>,
-    case_id: Option<i64>,
-    tab_id: String,
-    url: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    let label = browser_label(&tab_id)?;
-    let parsed = parse_browser_url(&url)?;
-    spawn_tab(&app, label, tauri::WebviewUrl::External(parsed), x, y, width, height)?;
-
-    if let Some(case_id) = case_id {
-        log_action(
-            &state.db_path,
-            case_id,
-            "browser_tab_opened",
-            &url,
-            "Oldal megnyitva a beépített böngészőben.",
-        )?;
-    }
-    Ok(())
-}
-
-/// A Google Lens-feltöltő oldal (a program saját `lens-upload.html` oldala) megnyitása fülben.
-/// Az oldal a főablak által átadott fotót egy űrlappal küldi a Google Lens-nek.
-#[tauri::command]
-async fn browser_open_lens_upload(
-    app: tauri::AppHandle,
-    tab_id: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-) -> Result<(), String> {
-    let label = browser_label(&tab_id)?;
-    spawn_tab(
-        &app,
-        label,
-        tauri::WebviewUrl::App("lens-upload.html".into()),
-        x,
-        y,
-        width,
-        height,
-    )
-}
-
-#[tauri::command]
-fn medication_links(name: String) -> Result<Vec<platforms::PlatformLink>, String> {
-    medication::links(&name)
 }
 
 #[tauri::command]
@@ -1542,8 +1497,6 @@ pub fn run() {
             update_source_review,
             archive_source,
             browser_open_tab,
-            browser_open_lens_upload,
-            medication_links,
             browser_set_bounds,
             browser_set_visible,
             browser_hide_all,

@@ -6,14 +6,12 @@ import HelpTooltip from "./components/HelpTooltip.vue";
 import SourceReviewPanel from "./components/SourceReviewPanel.vue";
 import BrowserPanel from "./components/BrowserPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
-import MedicationPanel from "./components/MedicationPanel.vue";
 import { captureTab, closeSearchTabs, openTab as openBrowserTab } from "./browserStore.js";
 
 const allTabs = [
   { id: "demo", label: "Bemutató", advanced: true },
   { id: "cases", label: "Ügyek" },
   { id: "browser", label: "Böngésző" },
-  { id: "medication", label: "Gyógyszer-ellenőrzés", alert: true },
   { id: "archive", label: "Archivum" },
   { id: "history", label: "Előzmények", advanced: true },
   { id: "audit", label: "Audit", advanced: true },
@@ -1065,46 +1063,6 @@ async function runBrowserSearch(query) {
   }
 }
 
-// ---- Gyógyszer-ellenőrzés (nem tárol semmit, nem kapcsolódik ügyhöz) ----
-
-async function openMedicationLens() {
-  try {
-    await closeSearchTabs("medication");
-    currentTab.value = "browser";
-    await openBrowserTab({ url: "", title: "Google Lens", kind: "medication", local: "lens-upload" });
-  } catch (error) {
-    appError.value = `A Google Lens fül nem nyitható meg: ${String(error)}`;
-  }
-}
-
-async function openMedicationManualLens() {
-  try {
-    await closeSearchTabs("medication");
-    currentTab.value = "browser";
-    await openBrowserTab({ url: "https://lens.google.com/", title: "Google Lens", kind: "medication" });
-  } catch (error) {
-    appError.value = `A Google Lens fül nem nyitható meg: ${String(error)}`;
-  }
-}
-
-async function openMedicationLinks(links) {
-  try {
-    await closeSearchTabs("medication");
-    currentTab.value = "browser";
-    for (let index = 0; index < links.length; index += 1) {
-      await openBrowserTab({
-        url: links[index].url,
-        title: links[index].label,
-        kind: "medication",
-        lazy: index > 0,
-        activate: index === 0,
-      });
-    }
-  } catch (error) {
-    appError.value = `A keresés nem indítható: ${String(error)}`;
-  }
-}
-
 async function archiveBrowserTab(tab) {
   if (!tab || !currentCase.value) return;
   notice.value = "";
@@ -1252,10 +1210,8 @@ function tierBadgeClass(tier) {
           :class="[
             'rounded-full border px-4 py-2 text-sm font-semibold transition',
             currentTab === tab.id
-              ? tab.alert ? 'border-red-700 bg-red-700 text-white' : 'border-slate-900 bg-slate-900 text-white'
-              : tab.alert
-                ? 'border-red-300 bg-red-50 text-red-700 hover:bg-red-100'
-                : 'border-white/70 bg-white/75 text-slate-700 hover:border-slate-300 hover:bg-white',
+              ? 'border-slate-900 bg-slate-900 text-white'
+              : 'border-white/70 bg-white/75 text-slate-700 hover:border-slate-300 hover:bg-white',
           ]"
         >
           {{ tab.label }}
@@ -1428,16 +1384,6 @@ function tierBadgeClass(tier) {
               </button>
             </div>
           </aside>
-        </section>
-
-        <section v-else-if="currentTab === 'medication'">
-          <MedicationPanel
-            @open-lens="openMedicationLens"
-            @open-manual-lens="openMedicationManualLens"
-            @open-links="openMedicationLinks"
-            @leave="currentTab = 'cases'"
-            @error="(message) => (appError = message)"
-          />
         </section>
 
         <section v-else-if="currentTab === 'browser'">
