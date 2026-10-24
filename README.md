@@ -90,3 +90,13 @@ Az **Egyszerű** mód (alapértelmezett) a napi munka fülei: Ügyek, Böngész�
 - **Futamok összehasonlítása:** minden futam elmenti a megnyitott címeit; az új, a kiesett és a tier-t váltó elemek az Előzmények fülön hasonlíthatók össze.
 
 Az ötletek egy része a Crucix (AGPL-3.0) nyílt forráskódú projektből származik; kód nem került átvételre, a megoldások önállóan, Rustban készültek.
+
+## Gyógyszer-ellenőrzés (gondozóknak és ellátottaknak)
+
+A **Gyógyszer-ellenőrzés** fül ismeretlen gyógyszer gyors, internetes utánanézéséhez ad segítséget. **Nem gyógyszerazonosítás**, és nem helyettesíti a gyógyszerész vagy az orvos szakértelmét.
+
+- **Figyelmeztetés minden indításnál:** a fül megnyitásakor és *minden* művelet előtt (kamera, kép kiválasztása, fotó küldése a Google Lens-nek, keresés névre) egy teljes képernyős figyelmeztetés jelenik meg, amelyet külön meg kell erősíteni. A fül tetején végig látható egy piros figyelmeztető sáv, és a megnyitott Lens-/keresőfülek fölött is ott marad.
+- **Fotó:** kamerával vagy képfájlból; a program legfeljebb 1600 képpontosra kicsinyíti, majd egy átmeneti, azonnal törlődő átadással küldi a Google Lens-nek. Ha az automatikus átadás nem működik, a „Google Lens megnyitása (kézi feltöltés)" gomb a lens.google.com oldalt nyitja.
+- **Név:** három keresés nyílik: betegtájékoztató, az OGYÉI hivatalos oldalai (`site:ogyei.gov.hu`) és képes találatok a doboz összevetéséhez.
+- **Adatvédelem:** a program nem tárolja a fotót és a gyógyszernevet, nem írja az audit naplóba, és a fül oldalai nem archiválhatók. A kép vagy a név a Google-hoz kerül.
+- A fül nem kapcsolódik ügyhöz, ezért ügy kiválasztása nélkül is használható.

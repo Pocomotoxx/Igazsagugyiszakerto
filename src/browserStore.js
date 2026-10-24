@@ -6,7 +6,6 @@ const LABEL_PREFIX = "browser-";
 const pending = new Map();
 
 export const browser = reactive({
-  caseId: null,
   tabs: [],
   activeId: null,
   bounds: { x: 0, y: 0, width: 800, height: 600 },
@@ -38,8 +37,8 @@ async function ensureListener() {
   await listen("browser-title", (event) => {
     const { label, title } = event.payload;
     const tab = browser.tabs.find((item) => labelOf(item) === label);
-    // a keresési fül a platform nevét viseli, a többi az oldal címét
-    if (tab && tab.kind !== "search" && title?.trim()) {
+    // a keresési és gyógyszer-ellenőrzési fül a saját nevét viseli, a többi az oldal címét
+    if (tab && tab.kind !== "search" && tab.kind !== "medication" && title?.trim()) {
       tab.title = title.trim();
       tab.titled = true;
     }
@@ -81,12 +80,16 @@ async function ensureCreated(tab) {
   tab.error = "";
   tab.slow = false;
   try {
-    await invoke("browser_open_tab", {
-      caseId: browser.caseId,
-      tabId: tab.id,
-      url: tab.url,
-      ...browser.bounds,
-    });
+    if (tab.local === "lens-upload") {
+      await invoke("browser_open_lens_upload", { tabId: tab.id, ...browser.bounds });
+    } else {
+      await invoke("browser_open_tab", {
+        caseId: tab.caseId ?? null,
+        tabId: tab.id,
+        url: tab.url,
+        ...browser.bounds,
+      });
+    }
   } catch (error) {
     // a sikertelen létrehozás látható hiba, nem végtelen töltésjelző; újrapróbálható
     tab.created = false;
@@ -110,11 +113,12 @@ export async function retryTab(tabId) {
   await activateTab(tabId);
 }
 
-export async function openTab({ caseId, url, title, kind = "page", lazy = false, activate = true }) {
+export async function openTab({ caseId = null, url = "", title, kind = "page", local = "", lazy = false, activate = true }) {
   await ensureListener();
   counter += 1;
-  browser.caseId = caseId;
   const tab = {
+    caseId,
+    local,
     id: `t${Date.now().toString(36)}${counter}`,
     url,
     title: title || shortTitle(url),
@@ -124,7 +128,7 @@ export async function openTab({ caseId, url, title, kind = "page", lazy = false,
     created: false,
     error: "",
     slow: false,
-    titled: Boolean(title) && kind === "search",
+    titled: Boolean(title) && (kind === "search" || kind === "medication"),
   };
   browser.tabs.push(tab);
   if (activate) await activateTab(tab.id);
@@ -151,8 +155,8 @@ export async function activateTab(tabId) {
 }
 
 /** Bezárja a korábbi keresés füleit (a kézzel nyitott oldalak megmaradnak). */
-export async function closeSearchTabs() {
-  const ids = browser.tabs.filter((tab) => tab.kind === "search").map((tab) => tab.id);
+export async function closeSearchTabs(kind = "search") {
+  const ids = browser.tabs.filter((tab) => tab.kind === kind).map((tab) => tab.id);
   // a bezárás közben nem aktiválunk másik fület (különben a lusta fülek sorra létrejönnének)
   for (const id of ids) await closeTab(id, { activateNext: false });
   if (!browser.tabs.some((tab) => tab.id === browser.activeId)) browser.activeId = null;

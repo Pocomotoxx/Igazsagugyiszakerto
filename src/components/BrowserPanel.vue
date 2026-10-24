@@ -249,8 +249,8 @@ async function run(action) {
 
       <button
         class="flex h-8 items-center gap-1.5 rounded-full bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-30"
-        :disabled="!activeTab"
-        title="Az oldal archiválása az aktív ügyhöz"
+        :disabled="!activeTab || activeTab.kind === 'medication'"
+        :title="activeTab?.kind === 'medication' ? 'A gyógyszer-ellenőrzés oldalai nem archiválhatók (egészségügyi adat).' : 'Az oldal archiválása az aktív ügyhöz'"
         @click="emit('archive', activeTab)"
       >⬇ Archiválás</button>
 
@@ -268,6 +268,15 @@ async function run(action) {
       <span v-else>Az oldal betöltése lassú vagy elakadt. Ha üres marad, próbáld újra, vagy nyisd meg külső böngészőben.</span>
       <button class="rounded-full border border-amber-300 bg-white px-3 py-1 font-semibold" @click="retryTab(activeTab.id)">Újra</button>
       <button class="rounded-full border border-amber-300 bg-white px-3 py-1 font-semibold" @click="openUrl(activeTab.url)">Külső böngészőben</button>
+    </div>
+
+    <!-- Gyógyszer-ellenőrzés: a figyelmeztetés a fülek mellett végig látszik -->
+    <div
+      v-if="activeTab && activeTab.kind === 'medication'"
+      role="alert"
+      class="border-b-2 border-red-700 bg-red-600 px-4 py-2 text-sm font-bold text-white"
+    >
+      ⚠ FIGYELEM: ez csak internetes keresés, NEM helyettesíti a szakszerű gyógyszerazonosítást. Ismeretlen gyógyszert ne vegyen be és ne adjon be senkinek; kérdezzen gyógyszerészt vagy orvost. Veszély esetén: 112.
     </div>
 
     <!-- Tartalom -->
