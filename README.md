@@ -23,6 +23,10 @@ npm run build
 
 Tauri futtatáshoz Windows alatt szükséges a Rust toolchain és az MSVC build tools (`link.exe`).
 
+## Telepítő (felhasználóknak)
+
+A felhasználóknak nem kell PowerShellt használniuk: egy kész `setup.exe`-t kapnak, amely dupla kattintással telepíthető (rendszergazdai jog nélkül, magyar nyelvű telepítővel, Start menü- és asztali parancsikonnal). Az elkészítés (GitHub Actions vagy `Telepito-keszitese.bat`) és a felhasználói útmutató: [TELEPITES.md](TELEPITES.md).
+
 ## Portable build
 
 Elokeszitesi ellenorzes:
