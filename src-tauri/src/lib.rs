@@ -9,6 +9,7 @@ use tauri::{Emitter, Manager};
 
 mod export;
 mod history;
+mod medication;
 mod platforms;
 mod provenance;
 mod story;
@@ -1244,6 +1245,11 @@ async fn browser_open_lens_upload(
 }
 
 #[tauri::command]
+fn medication_links(name: String) -> Result<Vec<platforms::PlatformLink>, String> {
+    medication::links(&name)
+}
+
+#[tauri::command]
 async fn browser_set_bounds(
     app: tauri::AppHandle,
     tab_id: String,
@@ -1537,6 +1543,7 @@ pub fn run() {
             archive_source,
             browser_open_tab,
             browser_open_lens_upload,
+            medication_links,
             browser_set_bounds,
             browser_set_visible,
             browser_hide_all,

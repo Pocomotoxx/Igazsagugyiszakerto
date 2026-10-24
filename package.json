@@ -9,8 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "portable:build": "powershell -ExecutionPolicy Bypass -File scripts/build-portable.ps1",
-    "portable:check": "powershell -ExecutionPolicy Bypass -File scripts/check-desktop-prereqs.ps1",
-    "test:web": "node --test src/medication/links.test.js"
+    "portable:check": "powershell -ExecutionPolicy Bypass -File scripts/check-desktop-prereqs.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

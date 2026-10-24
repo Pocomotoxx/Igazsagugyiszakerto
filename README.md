@@ -93,18 +93,10 @@ Az ötletek egy része a Crucix (AGPL-3.0) nyílt forráskódú projektből szá
 
 ## Gyógyszer-ellenőrzés (gondozóknak és ellátottaknak)
 
-Ismeretlen gyógyszer gyors, internetes utánanézése. **Nem gyógyszerazonosítás**, és nem helyettesíti a gyógyszerész vagy az orvos szakértelmét.
+A **Gyógyszer-ellenőrzés** fül ismeretlen gyógyszer gyors, internetes utánanézéséhez ad segítséget. **Nem gyógyszerazonosítás**, és nem helyettesíti a gyógyszerész vagy az orvos szakértelmét.
 
-**Három helyen fut, ugyanabból a kódból:**
-
-| Hol | Hogyan |
-|---|---|
-| Asztali IRBR (Tauri) | a „Gyógyszer-ellenőrzés" fül; a találatok a beépített böngészőpanel füleiben nyílnak |
-| **PWA** (mobil és asztali böngésző) | önálló, telepíthető oldal: `medication.html` (a `dist/` mappa statikus tárhelyre, **HTTPS** alatt tehető ki); Androidon az „Alkalmazás telepítése", iOS-en a „Megosztás → Főképernyőre" menüvel telepíthető |
-| Android / iOS (később) | natív héj (Tauri mobile vagy Capacitor) ugyanazzal az `src/components/MedicationPanel.vue` és `src/medication/links.js` kóddal |
-
-- **Figyelmeztetés minden indításnál:** a megnyitáskor és *minden* művelet előtt (fotó, képválasztás, küldés a Lens-nek, névkeresés, kézi Lens) teljes képernyős piros figyelmeztetés jelenik meg, amelyet külön meg kell erősíteni. A felület tetején végig látható egy piros figyelmeztető sáv; a böngészőpanelben megnyitott fülek fölött is ott marad. JavaScript nélkül is ugyanezt írja a `<noscript>` szöveg.
-- **Fotó:** telefonon a natív kamera (`capture`), asztali gépen webkamera vagy képfájl. A program legfeljebb 1600 képpontosra kicsinyíti, majd űrlapként küldi a Google Lens-nek új lapon. Ha ez nem működik, a „Google Lens megnyitása (kézi feltöltés)" gomb a lens.google.com oldalt nyitja.
-- **Név:** három keresés: betegtájékoztató, az OGYÉI hivatalos oldalai (`site:ogyei.gov.hu`) és képes találatok a doboz összevetéséhez. A név nem módosíthatja a lekérdezést (operátorok és idézőjelek kiszűrve).
-- **Adatvédelem:** a program nem tárol fotót és gyógyszernevet, nem naplózza, a böngészőpanelben megnyílt oldalak nem archiválhatók. A kép vagy a név a Google-hoz kerül. A service worker csak a saját oldalfájlokat tárolja, a Google-kéréseket soha.
-- **Fejlesztés:** `npm run test:web` a gyógyszerkereső-logika tesztjeit futtatja; `npm run build` a `dist/medication.html` oldalt is előállítja.
+- **Figyelmeztetés minden indításnál:** a fül megnyitásakor és *minden* művelet előtt (kamera, kép kiválasztása, fotó küldése a Google Lens-nek, keresés névre) egy teljes képernyős figyelmeztetés jelenik meg, amelyet külön meg kell erősíteni. A fül tetején végig látható egy piros figyelmeztető sáv, és a megnyitott Lens-/keresőfülek fölött is ott marad.
+- **Fotó:** kamerával vagy képfájlból; a program legfeljebb 1600 képpontosra kicsinyíti, majd egy átmeneti, azonnal törlődő átadással küldi a Google Lens-nek. Ha az automatikus átadás nem működik, a „Google Lens megnyitása (kézi feltöltés)" gomb a lens.google.com oldalt nyitja.
+- **Név:** három keresés nyílik: betegtájékoztató, az OGYÉI hivatalos oldalai (`site:ogyei.gov.hu`) és képes találatok a doboz összevetéséhez.
+- **Adatvédelem:** a program nem tárolja a fotót és a gyógyszernevet, nem írja az audit naplóba, és a fül oldalai nem archiválhatók. A kép vagy a név a Google-hoz kerül.
+- A fül nem kapcsolódik ügyhöz, ezért ügy kiválasztása nélkül is használható.

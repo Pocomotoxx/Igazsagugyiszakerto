@@ -1,15 +1,11 @@
 <script setup>
 import { onBeforeUnmount, onMounted, ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import DisclaimerDialog from "./DisclaimerDialog.vue";
-import { buildLinks, LENS_MANUAL_URL, LENS_UPLOAD_URL } from "../medication/links.js";
 
 const emit = defineEmits(["open-lens", "open-manual-lens", "open-links", "leave", "error"]);
 
 const LENS_IMAGE_KEY = "irbr-lens-image";
-// Az asztali (Tauri) héjban a találatok a beépített böngészőpanel füleiben nyílnak; böngészőben
-// (PWA) és később Android/iOS alatt a rendszer böngészője kapja őket. A logika ugyanaz.
-const desktopShell = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-const webLinks = ref([]);
 const MAX_SIDE = 1600;
 
 // Minden művelet indítása előtt megjelenik a figyelmeztetés; a megerősítés után fut le a művelet.
@@ -19,9 +15,6 @@ const imageData = ref("");
 const cameraOn = ref(false);
 const video = ref(null);
 const fileInput = ref(null);
-const captureInput = ref(null);
-// Érintőképernyős eszközön a natív kamera (capture) a legmegbízhatóbb; a webkamera az asztali gépeké.
-const touchDevice = typeof navigator !== "undefined" && navigator.maxTouchPoints > 0;
 let stream = null;
 
 function askThen(action, run) {
@@ -114,47 +107,7 @@ function discardImage() {
   imageData.value = "";
 }
 
-function dataUrlToFile(dataUrl) {
-  const comma = dataUrl.indexOf(",");
-  const type = (dataUrl.slice(0, comma).match(/data:([^;]+)/) || [])[1] || "image/jpeg";
-  const binary = atob(dataUrl.slice(comma + 1));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return new File([bytes], "gyogyszer.jpg", { type });
-}
-
-/** Böngészőben/PWA-ban: a fotót űrlapként küldi a Google Lens-nek új lapon (a megerősítő kattintásból, szinkron). */
-function submitToLensInBrowser(dataUrl) {
-  const form = document.createElement("form");
-  form.method = "POST";
-  form.action = LENS_UPLOAD_URL;
-  form.enctype = "multipart/form-data";
-  form.target = "_blank";
-  form.rel = "noopener noreferrer";
-  form.style.display = "none";
-  const input = document.createElement("input");
-  input.type = "file";
-  input.name = "encoded_image";
-  const transfer = new DataTransfer();
-  transfer.items.add(dataUrlToFile(dataUrl));
-  input.files = transfer.files;
-  form.appendChild(input);
-  document.body.appendChild(form);
-  form.submit();
-  form.remove();
-}
-
 function sendToLens() {
-  if (!desktopShell) {
-    try {
-      submitToLensInBrowser(imageData.value);
-    } catch {
-      emit("error", "A fotó nem adható át a Google Lens-nek. Használd a „Google Lens megnyitása (kézi feltöltés)” gombot.");
-      return;
-    }
-    imageData.value = "";
-    return;
-  }
   try {
     localStorage.setItem(LENS_IMAGE_KEY, imageData.value);
   } catch {
@@ -165,25 +118,12 @@ function sendToLens() {
   emit("open-lens");
 }
 
-function openManualLens() {
-  if (desktopShell) {
-    emit("open-manual-lens");
-  } else {
-    window.open(LENS_MANUAL_URL, "_blank", "noopener,noreferrer");
-  }
-}
-
-function searchByName() {
+async function searchByName() {
   try {
-    const links = buildLinks(medName.value);
-    if (desktopShell) {
-      emit("open-links", links);
-    } else {
-      // böngészőben egy kattintás egy lapot nyithat (a felugró-blokkoló miatt): a találatok linkként jelennek meg
-      webLinks.value = links;
-    }
+    const links = await invoke("medication_links", { name: medName.value });
+    emit("open-links", links);
   } catch (error) {
-    emit("error", error.message);
+    emit("error", String(error));
   }
 }
 </script>
@@ -231,24 +171,14 @@ function searchByName() {
           </div>
 
           <div v-else class="flex flex-wrap gap-2">
-            <button
-              v-if="touchDevice"
-              class="rounded-full bg-sky-600 px-5 py-3 text-base font-semibold text-white hover:bg-sky-500"
-              @click="askThen('Fénykép készítése a telefon kamerájával', () => captureInput?.click())"
-            >📷 Fénykép készítése</button>
-            <button
-              v-else
-              class="rounded-full bg-sky-600 px-5 py-3 text-base font-semibold text-white hover:bg-sky-500"
-              @click="askThen('A webkamera bekapcsolása', startCamera)"
-            >📷 Webkamera indítása</button>
+            <button class="rounded-full bg-sky-600 px-5 py-3 text-base font-semibold text-white hover:bg-sky-500" @click="askThen('A kamera bekapcsolása', startCamera)">📷 Kamera indítása</button>
             <button class="rounded-full border border-slate-300 bg-white px-5 py-3 text-base font-semibold text-slate-700" @click="askThen('Kép kiválasztása fájlból', () => fileInput?.click())">Kép kiválasztása</button>
           </div>
           <input ref="fileInput" type="file" accept="image/*" class="hidden" @change="onFileChosen" />
-          <input ref="captureInput" type="file" accept="image/*" capture="environment" class="hidden" @change="onFileChosen" />
 
           <button
             class="justify-self-start text-sm font-semibold text-slate-600 underline-offset-2 hover:underline"
-            @click="askThen('A Google Lens megnyitása kézi feltöltéshez', openManualLens)"
+            @click="askThen('A Google Lens megnyitása kézi feltöltéshez', () => emit('open-manual-lens'))"
           >A Google Lens megnyitása (kézi feltöltés)</button>
         </section>
 
@@ -268,17 +198,6 @@ function searchByName() {
             class="justify-self-start rounded-full bg-red-600 px-6 py-3 text-base font-bold text-white hover:bg-red-700 disabled:opacity-50"
             @click="askThen('Keresés a gyógyszer nevére', searchByName)"
           >Keresés</button>
-          <div v-if="webLinks.length" class="grid gap-2">
-            <div class="text-sm font-semibold text-slate-700">Nyisd meg a keresések egyikét (új lapon):</div>
-            <a
-              v-for="link in webLinks"
-              :key="link.id"
-              :href="link.url"
-              target="_blank"
-              rel="noopener noreferrer"
-              class="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-base font-semibold text-red-800 hover:bg-red-100"
-            >{{ link.label }} →</a>
-          </div>
         </section>
       </div>
 
