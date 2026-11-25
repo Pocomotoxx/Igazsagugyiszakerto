@@ -144,7 +144,7 @@ pub fn observed_from_snapshot(snapshot: &str) -> String {
 
 const RECORD_COLUMNS: &str = "id, case_id, search_run_id, title, url, original_url, archived_url, archive_kind, tier, \
     source_status, usability_decision, hash, file_path, timestamp, snapshot_timestamp, published_at, modified_at, \
-    time_source, reviewer_name, proof_summary, relevance_note, probative_value, missing_points";
+    time_source, reviewer_name, proof_summary, relevance_note, probative_value, missing_points, capture_kind, capture_truncated";
 
 fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ExportRecord> {
     let tier: i32 = row.get::<_, Option<i32>>(8)?.unwrap_or(3);
@@ -175,6 +175,8 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ExportRecord> {
         relevance_note: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
         probative_value: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
         missing_points: row.get::<_, Option<String>>(22)?.unwrap_or_default(),
+        capture_kind: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
+        capture_truncated: row.get::<_, Option<i64>>(24)?.unwrap_or(0) != 0,
     })
 }
 
@@ -345,7 +347,13 @@ pub fn domain_of(url: &str) -> String {
 }
 
 fn check_integrity(record: &ExportRecord, archive_dir: &Path) -> Integrity {
-    let stored = record.hash.trim().to_string();
+    check_file(&record.file_path, &record.hash, archive_dir)
+}
+
+/// Az archivált fájl SHA-256 értékének visszaellenőrzése a rögzített értékkel szemben. A fájl
+/// csak az archívum mappán belül olvasható.
+pub fn check_file(file_path: &str, stored_hash: &str, archive_dir: &Path) -> Integrity {
+    let stored = stored_hash.trim().to_string();
     if stored.is_empty() {
         return Integrity {
             state: "nincs hash".into(),
@@ -354,12 +362,12 @@ fn check_integrity(record: &ExportRecord, archive_dir: &Path) -> Integrity {
             detail: "Ehhez a rekordhoz nem tartozik rögzített hash.".into(),
         };
     }
-    let path = Path::new(&record.file_path);
+    let path = Path::new(file_path);
     let inside = match (path.canonicalize(), archive_dir.canonicalize()) {
         (Ok(p), Ok(a)) => p.starts_with(a),
         _ => false,
     };
-    if record.file_path.trim().is_empty() || !path.exists() || !inside {
+    if file_path.trim().is_empty() || !path.exists() || !inside {
         return Integrity {
             state: "hiányzik".into(),
             stored_hash: stored,
@@ -645,7 +653,9 @@ fn load_run(conn: &Connection, run_id: i64) -> Result<BTreeMap<String, RunItem>,
 }
 
 /// `run_a` a régebbi (alap), `run_b` az újabb. Új = csak B-ben van; kiesett = csak A-ban.
-pub fn compare_runs(conn: &Connection, run_a: i64, run_b: i64) -> Result<RunDelta, String> {
+pub fn compare_runs(conn: &Connection, case_id: i64, run_a: i64, run_b: i64) -> Result<RunDelta, String> {
+    crate::integrity::ensure_run_belongs(conn, case_id, Some(run_a))?;
+    crate::integrity::ensure_run_belongs(conn, case_id, Some(run_b))?;
     let a = load_run(conn, run_a)?;
     let b = load_run(conn, run_b)?;
     let mut new_items = Vec::new();
@@ -701,7 +711,7 @@ mod tests {
             "CREATE TABLE sources (id INTEGER PRIMARY KEY AUTOINCREMENT, case_id INTEGER, search_run_id INTEGER, title TEXT, url TEXT, \
                original_url TEXT, archived_url TEXT, archive_kind TEXT, tier INTEGER, content TEXT, file_path TEXT, hash TEXT, timestamp TEXT, \
                snapshot_timestamp TEXT, source_status TEXT, usability_decision TEXT, proof_summary TEXT, reviewer_name TEXT, \
-               relevance_note TEXT, probative_value TEXT, missing_points TEXT, published_at TEXT, modified_at TEXT, time_source TEXT);
+               relevance_note TEXT, probative_value TEXT, missing_points TEXT, published_at TEXT, modified_at TEXT, time_source TEXT, capture_kind TEXT, capture_truncated INTEGER);
              CREATE TABLE audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, case_id INTEGER, timestamp TEXT, action_type TEXT, query TEXT, details TEXT);
              CREATE TABLE search_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, case_id INTEGER, created_at TEXT, summary TEXT, base_query TEXT, health TEXT);
              CREATE TABLE run_results (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, url_key TEXT, url TEXT, title TEXT, tier INTEGER, \
@@ -816,9 +826,15 @@ mod tests {
             evidence_level: "RETRIEVED".into(),
             story_id: 0,
         };
+        for case in [1, 1, 2] {
+            c.execute("INSERT INTO search_runs (case_id, created_at, summary, base_query) VALUES (?1, 't', 's', 'q')", params![case]).unwrap();
+        }
         save_run_results(&c, 1, &[item("https://a.hu/1", 3), item("https://a.hu/2", 3), item("https://www.a.hu/3/?utm_x=1", 2)]).unwrap();
         save_run_results(&c, 2, &[item("https://a.hu/1", 3), item("https://a.hu/3", 1), item("https://a.hu/4", 3)]).unwrap();
-        let delta = compare_runs(&c, 1, 2).unwrap();
+        let delta = compare_runs(&c, 1, 1, 2).unwrap();
+        // másik ügy futamával nem hasonlítható össze (az audit 1. hibájának olvasási párja)
+        assert!(compare_runs(&c, 1, 1, 3).unwrap_err().contains("másik ügyhöz"));
+        assert!(compare_runs(&c, 2, 1, 2).is_err());
         assert_eq!(delta.kept_count, 2);
         assert_eq!(delta.new_total, 1);
         assert_eq!(delta.dropped_total, 1);

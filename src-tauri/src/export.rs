@@ -31,6 +31,9 @@ pub struct ExportRecord {
     pub relevance_note: String,
     pub probative_value: String,
     pub missing_points: String,
+    /// "teljes_oldal", "kijelolt_szoveg" vagy üres (ismeretlen, régi rekord).
+    pub capture_kind: String,
+    pub capture_truncated: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -49,7 +52,7 @@ const FIELDS: &[&str] = &[
     "id", "title", "url", "original_url", "archived_url", "archive_kind", "tier", "source_status",
     "usability_decision", "hash", "collected_at", "observed_at", "published_at", "modified_at",
     "time_source", "freshness", "reviewer_name", "proof_summary", "relevance_note",
-    "probative_value", "missing_points", "search_run_id", "file_path",
+    "probative_value", "missing_points", "capture_kind", "capture_truncated", "search_run_id", "file_path",
 ];
 
 fn field_value(record: &ExportRecord, field: &str) -> String {
@@ -75,6 +78,8 @@ fn field_value(record: &ExportRecord, field: &str) -> String {
         "relevance_note" => record.relevance_note.clone(),
         "probative_value" => record.probative_value.clone(),
         "missing_points" => record.missing_points.clone(),
+        "capture_kind" => record.capture_kind.clone(),
+        "capture_truncated" => record.capture_truncated.to_string(),
         "search_run_id" => record.search_run_id.map(|v| v.to_string()).unwrap_or_default(),
         "file_path" => record.file_path.clone(),
         _ => String::new(),
@@ -126,6 +131,19 @@ pub fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn capture_label(record: &ExportRecord) -> String {
+    let kind = match record.capture_kind.as_str() {
+        "kijelolt_szoveg" => "kijelölt szövegrészlet (nem a teljes oldal)",
+        "teljes_oldal" => "teljes oldal szövege",
+        _ => "ismeretlen (régi rekord)",
+    };
+    if record.capture_truncated {
+        format!("{kind}, csonkolva")
+    } else {
+        kind.to_string()
+    }
+}
+
 pub fn to_html(records: &[ExportRecord], metadata: &ExportMetadata) -> String {
     let mut out = String::new();
     out.push_str("<!doctype html><html lang=\"hu\"><head><meta charset=\"utf-8\">");
@@ -152,7 +170,7 @@ pub fn to_html(records: &[ExportRecord], metadata: &ExportMetadata) -> String {
     ));
     for record in records {
         out.push_str(&format!("<article><h2>{}</h2><dl>", html_escape(&record.title)));
-        let rows: [(&str, String); 14] = [
+        let rows: [(&str, String); 15] = [
             ("URL", record.url.clone()),
             ("Tier / státusz", format!("{} / {}", record.tier, record.source_status)),
             ("Felhasználhatóság", record.usability_decision.clone()),
@@ -161,6 +179,7 @@ pub fn to_html(records: &[ExportRecord], metadata: &ExportMetadata) -> String {
             ("Megfigyelés (snapshot)", record.observed_at.clone()),
             ("Begyűjtés", record.collected_at.clone()),
             ("Időforrás", record.time_source.clone()),
+            ("Rögzítés módja", capture_label(record)),
             ("Frissesség", record.freshness.clone()),
             ("SHA-256", record.hash.clone()),
             ("Bizonyító erő", record.probative_value.clone()),

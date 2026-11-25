@@ -9,8 +9,10 @@ use tauri::{Emitter, Manager};
 
 mod export;
 mod history;
+mod integrity;
 mod platforms;
 mod provenance;
+mod release;
 mod story;
 
 /// A megszakított sentinel-navigáció hosztja: így jut vissza az oldal szövege IPC nélkül.
@@ -91,6 +93,9 @@ pub struct Source {
     pub relevance_note: String,
     pub probative_value: String,
     pub missing_points: String,
+    /// "teljes_oldal", "kijelolt_szoveg" vagy üres (régi rekord, ismeretlen).
+    pub capture_kind: String,
+    pub capture_truncated: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -251,7 +256,36 @@ fn init_schema(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-const SCHEMA_VERSION: i64 = 2;
+const RUN_RESULTS_DDL: &str = "CREATE TABLE IF NOT EXISTS run_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    url_key TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    tier INTEGER NOT NULL DEFAULT 3,
+    source_type TEXT NOT NULL DEFAULT '',
+    query_used TEXT NOT NULL DEFAULT '',
+    published_at TEXT NOT NULL DEFAULT '',
+    evidence_level TEXT NOT NULL DEFAULT '',
+    story_id INTEGER NOT NULL DEFAULT 0
+)";
+
+const REPORT_VERSIONS_DDL: &str = "CREATE TABLE IF NOT EXISTS report_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    approved_by TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    final_opinion TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    file_path TEXT NOT NULL DEFAULT '',
+    UNIQUE(case_id, version)
+)";
+
+const SCHEMA_VERSION: i64 = 3;
 
 /// true, ha a `table` tartalmazza a `column` oszlopot. A `table`/`column`
 /// kizárólag kódban rögzített literál lehet (nincs felhasználói input) → nincs SQLi.
@@ -338,6 +372,16 @@ fn migrate_schema(conn: &Connection) -> Result<(), String> {
         add_column_if_missing(conn, "sources", col, def)?;
     }
     add_column_if_missing(conn, "search_runs", "health", "TEXT NOT NULL DEFAULT '[]'")?;
+
+    // v3: rögzítés módja, kiadott riportverziók, ügyhatárok (triggerek)
+    add_column_if_missing(conn, "sources", "capture_kind", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "sources", "capture_truncated", "INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute(RUN_RESULTS_DDL, []).map_err(|e| e.to_string())?;
+    conn.execute(REPORT_VERSIONS_DDL, []).map_err(|e| e.to_string())?;
+    integrity::install_triggers(conn)?;
+    // a régi, ellentmondó rekordokat nem javítjuk, hanem auditbejegyzésben felsoroljuk
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    integrity::log_legacy_mismatches(conn, &timestamp)?;
 
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|e| e.to_string())?;
@@ -545,6 +589,28 @@ fn update_case_opinions(
         )
         .map_err(|e| e.to_string())?;
 
+    // A véglegesített állapot egyetlen, a háttérrendszerben érvényesített szabályból következik:
+    // a felület kerülőútján (vagy hibás kliensből) sem menthető ellentmondó véglegesítés.
+    if report_status == "veglegesitett" {
+        let issues = release::finalization_issues(
+            &conn,
+            &archive_dir_for(&state.db_path),
+            id,
+            &release::Opinion {
+                final_opinion: &final_opinion,
+                finalizable: &finalizable,
+                open_questions: &open_questions,
+            },
+            true,
+        )?;
+        if !issues.is_empty() {
+            return Err(format!(
+                "A „véglegesített” állapot nem menthető: {}",
+                issues.join(" | ")
+            ));
+        }
+    }
+
     conn.execute(
         "UPDATE cases
          SET preliminary_opinion = ?1, final_opinion = ?2, report_status = ?3,
@@ -576,9 +642,8 @@ fn update_case_opinions(
     Ok("Ügy álláspontjai mentve.".to_string())
 }
 
-#[tauri::command]
-fn delete_case(state: tauri::State<'_, DbState>, id: i64) -> Result<String, String> {
-    let mut conn = get_connection(&state.db_path)?;
+fn remove_case(db_path: &str, id: i64) -> Result<String, String> {
+    let mut conn = get_connection(db_path)?;
 
     let file_paths: Vec<String> = {
         let mut stmt = conn
@@ -590,8 +655,26 @@ fn delete_case(state: tauri::State<'_, DbState>, id: i64) -> Result<String, Stri
         iter.filter_map(|item| item.ok()).collect()
     };
 
+    let report_files: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT file_path FROM report_versions WHERE case_id = ?1 AND file_path != ''")
+            .map_err(|e| e.to_string())?;
+        let iter = stmt
+            .query_map(params![id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        iter.filter_map(|item| item.ok()).collect()
+    };
+
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // az ügy sora előbb törlődik: ez engedi a kiadott verziók törlését (azok egyébként védettek)
     tx.execute("DELETE FROM cases WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM run_results WHERE run_id IN (SELECT id FROM search_runs WHERE case_id = ?1)",
+        params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM report_versions WHERE case_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM sources WHERE case_id = ?1", params![id])
         .map_err(|e| e.to_string())?;
@@ -602,10 +685,17 @@ fn delete_case(state: tauri::State<'_, DbState>, id: i64) -> Result<String, Stri
     tx.commit().map_err(|e| e.to_string())?;
 
     let mut failed_files = 0usize;
+    for path in report_files.iter() {
+        match fs::remove_file(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed_files += 1,
+        }
+    }
     for path in &file_paths {
-        if !is_within_archive(&state.db_path, path) {
+        if !is_within_archive(db_path, path) {
             let _ = log_action(
-                &state.db_path,
+                db_path,
                 id,
                 "case_file_delete_skipped_out_of_scope",
                 path,
@@ -626,7 +716,12 @@ fn delete_case(state: tauri::State<'_, DbState>, id: i64) -> Result<String, Stri
         ));
     }
 
-    Ok("Ügy és kapcsolódó adatok törölve.".to_string())
+    Ok("Ügy és kapcsolódó adatok törölve. A korábban kézzel mentett riport-tervezetek és exportok (reports/, exports/ mappa) nem törlődtek.".to_string())
+}
+
+#[tauri::command]
+fn delete_case(state: tauri::State<'_, DbState>, id: i64) -> Result<String, String> {
+    remove_case(&state.db_path, id)
 }
 
 #[tauri::command]
@@ -636,7 +731,7 @@ fn get_sources(state: tauri::State<'_, DbState>, case_id: i64) -> Result<Vec<Sou
         .prepare(
             "SELECT id, case_id, search_run_id, title, url, original_url, archived_url, snapshot_timestamp, archive_kind, tier, content, file_path, hash, timestamp,
                     source_status, priority_level, usability_decision, proof_summary, reviewer_name, reviewed_at,
-                    relevance_note, probative_value, missing_points
+                    relevance_note, probative_value, missing_points, capture_kind, capture_truncated
              FROM sources
              WHERE case_id = ?1
              ORDER BY priority_level ASC, id DESC",
@@ -669,6 +764,8 @@ fn get_sources(state: tauri::State<'_, DbState>, case_id: i64) -> Result<Vec<Sou
                 relevance_note: row.get(20)?,
                 probative_value: row.get(21)?,
                 missing_points: row.get(22)?,
+                capture_kind: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
+                capture_truncated: row.get::<_, Option<i64>>(24)?.unwrap_or(0) != 0,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -818,6 +915,7 @@ fn record_search_run(
     results: Option<Vec<history::RunResultInput>>,
 ) -> Result<i64, String> {
     let conn = get_connection(&state.db_path)?;
+    integrity::ensure_case_exists(&conn, case_id)?;
     let created_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     conn.execute(
@@ -931,19 +1029,42 @@ fn update_source_review(
     Ok("Forrásértékelés mentve.".to_string())
 }
 
-#[tauri::command]
-fn archive_source(
-    state: tauri::State<'_, DbState>,
-    case_id: i64,
-    search_run_id: Option<i64>,
-    title: String,
-    url: String,
-    tier: i32,
-    content: String,
-    published_at: Option<String>,
-    modified_at: Option<String>,
-    time_source: Option<String>,
-) -> Result<Source, String> {
+pub struct ArchiveInput {
+    pub case_id: i64,
+    pub search_run_id: Option<i64>,
+    pub title: String,
+    pub url: String,
+    pub tier: i32,
+    pub content: String,
+    pub published_at: Option<String>,
+    pub modified_at: Option<String>,
+    pub time_source: Option<String>,
+    pub capture_kind: Option<String>,
+    pub capture_truncated: bool,
+}
+
+/// A forrás archiválása. Előbb ellenőrzi az ügyet és a futam hovatartozását (nincs idegen ügyhöz
+/// kötött mentés és nincs rekord nélküli fájl), a fájl kizárólagosan jön létre (nem írhat felül
+/// másikat), és a beszúrás hibájakor a fájl is törlődik.
+pub fn store_source(db_path: &str, input: ArchiveInput) -> Result<Source, String> {
+    let conn = get_connection(db_path)?;
+    integrity::ensure_case_exists(&conn, input.case_id)?;
+    integrity::ensure_run_belongs(&conn, input.case_id, input.search_run_id)?;
+
+    let ArchiveInput {
+        case_id,
+        search_run_id,
+        title,
+        url,
+        tier,
+        content,
+        published_at,
+        modified_at,
+        time_source,
+        capture_kind,
+        capture_truncated,
+    } = input;
+
     let now_utc = chrono::Utc::now();
     let published_at = published_at
         .and_then(|v| provenance::normalize_time(&v, now_utc))
@@ -957,6 +1078,11 @@ fn archive_source(
         time_source
             .map(|v| v.chars().take(20).collect::<String>())
             .unwrap_or_default()
+    };
+    let capture_kind = match capture_kind.as_deref() {
+        Some("teljes_oldal") => "teljes_oldal".to_string(),
+        Some("kijelolt_szoveg") => "kijelolt_szoveg".to_string(),
+        _ => String::new(),
     };
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let (original_url, archived_url, snapshot_timestamp) = detect_archive_metadata(&url);
@@ -978,24 +1104,38 @@ fn archive_source(
     hasher.update(content.as_bytes());
     let hash_hex = hex::encode(hasher.finalize());
 
-    let archive_dir = Path::new(&state.db_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("archive");
+    let archive_dir = archive_dir_for(db_path);
+    fs::create_dir_all(&archive_dir).map_err(|e| e.to_string())?;
 
-    if !archive_dir.exists() {
-        fs::create_dir_all(&archive_dir).map_err(|e| e.to_string())?;
+    // kizárólagos fájllétrehozás: azonos ezredmásodpercnél sem írható felül másik forrás fájlja
+    let mut file_path = archive_dir.join(format!("src_{case_id}_{}.txt", Local::now().timestamp_millis()));
+    let mut attempt = 0u32;
+    let mut file = loop {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&file_path) {
+            Ok(file) => break file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 50 => {
+                attempt += 1;
+                file_path = archive_dir.join(format!(
+                    "src_{case_id}_{}_{attempt}.txt",
+                    Local::now().timestamp_millis()
+                ));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
+    {
+        use std::io::Write;
+        file.write_all(content.as_bytes()).map_err(|e| {
+            let _ = fs::remove_file(&file_path);
+            e.to_string()
+        })?;
     }
-
-    let file_name = format!("src_{case_id}_{}.txt", Local::now().timestamp_millis());
-    let file_path = archive_dir.join(file_name);
-    fs::write(&file_path, &content).map_err(|e| e.to_string())?;
+    drop(file);
     let file_path_str = file_path.to_string_lossy().into_owned();
 
-    let conn = get_connection(&state.db_path)?;
-    conn.execute(
-        "INSERT INTO sources (case_id, search_run_id, title, url, original_url, archived_url, snapshot_timestamp, archive_kind, tier, content, file_path, hash, timestamp, published_at, modified_at, time_source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+    let inserted = conn.execute(
+        "INSERT INTO sources (case_id, search_run_id, title, url, original_url, archived_url, snapshot_timestamp, archive_kind, tier, content, file_path, hash, timestamp, published_at, modified_at, time_source, capture_kind, capture_truncated)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             case_id,
             search_run_id,
@@ -1012,20 +1152,27 @@ fn archive_source(
             timestamp,
             published_at,
             modified_at,
-            time_source
+            time_source,
+            capture_kind,
+            capture_truncated as i64
         ],
-    )
-    .map_err(|e| e.to_string())?;
+    );
+    if let Err(error) = inserted {
+        let _ = fs::remove_file(&file_path); // ne maradjon fájl rekord nélkül
+        return Err(error.to_string());
+    }
 
     let new_id = conn.last_insert_rowid();
     log_action(
-        &state.db_path,
+        db_path,
         case_id,
         "source_archiving",
         &url,
         &format!(
-            "Forrás archiválva. Cím: {title}, hash: {hash_hex}, archiv tipus: {}, eredeti URL: {}",
+            "Forrás archiválva. Cím: {title}, hash: {hash_hex}, archiv tipus: {}, rögzítés: {}{}, eredeti URL: {}",
             archive_kind,
+            if capture_kind.is_empty() { "ismeretlen" } else { &capture_kind },
+            if capture_truncated { " (csonkolt)" } else { "" },
             if original_url.is_empty() { "n/a" } else { &original_url }
         ),
     )?;
@@ -1047,11 +1194,7 @@ fn archive_source(
         timestamp,
         source_status: "nyers".to_string(),
         priority_level: if is_reddit || is_facebook { 3 } else { 2 },
-        usability_decision: if is_reddit {
-            "hatteranyag".to_string()
-        } else {
-            "hatteranyag".to_string()
-        },
+        usability_decision: "hatteranyag".to_string(),
         proof_summary: String::new(),
         reviewer_name: String::new(),
         reviewed_at: String::new(),
@@ -1066,7 +1209,42 @@ fn archive_source(
             String::new()
         },
         missing_points: String::new(),
+        capture_kind,
+        capture_truncated,
     })
+}
+
+#[tauri::command]
+fn archive_source(
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    search_run_id: Option<i64>,
+    title: String,
+    url: String,
+    tier: i32,
+    content: String,
+    published_at: Option<String>,
+    modified_at: Option<String>,
+    time_source: Option<String>,
+    capture_kind: Option<String>,
+    capture_truncated: Option<bool>,
+) -> Result<Source, String> {
+    store_source(
+        &state.db_path,
+        ArchiveInput {
+            case_id,
+            search_run_id,
+            title,
+            url,
+            tier,
+            content,
+            published_at,
+            modified_at,
+            time_source,
+            capture_kind,
+            capture_truncated: capture_truncated.unwrap_or(false),
+        },
+    )
 }
 
 // ---- Beépített böngészőpanel (több webview a főablakban) ----
@@ -1294,7 +1472,11 @@ async fn browser_action(app: tauri::AppHandle, tab_id: String, action: String) -
 
 /// Kéri az aktív oldal megjelenített szövegét; az eredmény a `browser-page-text` eseményben érkezik.
 #[tauri::command]
-async fn browser_capture_text(app: tauri::AppHandle, tab_id: String) -> Result<(), String> {
+async fn browser_capture_text(
+    app: tauri::AppHandle,
+    tab_id: String,
+    selection_only: Option<bool>,
+) -> Result<(), String> {
     let label = browser_label(&tab_id)?;
     let webview = app
         .get_webview(&label)
@@ -1308,15 +1490,25 @@ async fn browser_capture_text(app: tauri::AppHandle, tab_id: String) -> Result<(
     var t = document.querySelector("time[datetime]");
     return names[0].indexOf("published") >= 0 && t ? t.getAttribute("datetime") : "";
   }
+  var SELECTION_ONLY = __SELECTION_ONLY__;
+  function clean(t) { return String(t || "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim(); }
+  var selected = clean(window.getSelection ? window.getSelection().toString() : "");
+  var full = clean(document.body && document.body.innerText);
+  var LIMIT = 20000;
+  var source = SELECTION_ONLY ? selected : full;
   var data = {
     title: document.title || "",
     url: location.href,
-    text: ((document.body && document.body.innerText) || "").replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").slice(0, 20000),
+    kind: SELECTION_ONLY ? "kijelolt_szoveg" : "teljes_oldal",
+    empty_selection: SELECTION_ONLY && !selected,
+    text: source.slice(0, LIMIT),
+    truncated: source.length > LIMIT,
     published: meta(["article:published_time", "datePublished", "og:published_time", "date"]),
     modified: meta(["article:modified_time", "dateModified", "og:updated_time"]) || document.lastModified || ""
   };
   location.href = "https://irbr-scrape.invalid/#" + encodeURIComponent(JSON.stringify(data));
 })();"#;
+    let script = script.replace("__SELECTION_ONLY__", if selection_only.unwrap_or(false) { "true" } else { "false" });
     webview.eval(script).map_err(|e| e.to_string())
 }
 
@@ -1355,10 +1547,14 @@ fn search_history(
 #[tauri::command]
 fn inspect_source(
     state: tauri::State<'_, DbState>,
+    case_id: i64,
     source_id: i64,
 ) -> Result<history::Inspection, String> {
     let conn = get_connection(&state.db_path)?;
     let inspection = history::inspect(&conn, source_id, &archive_dir_for(&state.db_path))?;
+    if inspection.record.case_id != case_id {
+        return Err("A forrás másik ügyhöz tartozik.".to_string());
+    }
     log_action(
         &state.db_path,
         inspection.record.case_id,
@@ -1423,11 +1619,12 @@ fn export_sources(
 #[tauri::command]
 fn compare_search_runs(
     state: tauri::State<'_, DbState>,
+    case_id: i64,
     run_a: i64,
     run_b: i64,
 ) -> Result<history::RunDelta, String> {
     let conn = get_connection(&state.db_path)?;
-    history::compare_runs(&conn, run_a, run_b)
+    history::compare_runs(&conn, case_id, run_a, run_b)
 }
 
 #[tauri::command]
@@ -1446,22 +1643,68 @@ fn save_report(
     }
 
     let file_name = format!(
-        "irbr_riport_{case_id}_{}.md",
+        "irbr_tervezet_{case_id}_{}.md",
         Local::now().format("%Y%m%d_%H%M%S_%3f")
     );
     let file_path = reports_dir.join(file_name);
-    fs::write(&file_path, report_content).map_err(|e| e.to_string())?;
+    // a szabadon szerkeszthető export mindig tervezetként van jelölve (a végleges kiadás külön, jóváhagyással készül)
+    fs::write(&file_path, release::mark_draft(&report_content)).map_err(|e| e.to_string())?;
     let path_str = file_path.to_string_lossy().into_owned();
 
     log_action(
         &state.db_path,
         case_id,
-        "report_generation",
+        "report_draft_saved",
         &path_str,
-        "Kutatási összefoglaló mentve Markdown formátumban.",
+        "Riport-tervezet mentve Markdown formátumban (nem végleges kiadás).",
     )?;
 
     Ok(path_str)
+}
+
+/// Végleges kiadás: mentett, véglegesített ügyállapotból, a szakértő nevével jóváhagyva, verziózva.
+#[tauri::command]
+fn approve_final_report(
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+    approver_name: String,
+    report_content: String,
+) -> Result<release::VersionInfo, String> {
+    let conn = get_connection(&state.db_path)?;
+    let reports_dir = Path::new(&state.db_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("reports");
+    let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let info = release::approve(
+        &conn,
+        &archive_dir_for(&state.db_path),
+        &reports_dir,
+        case_id,
+        &approver_name,
+        &report_content,
+        &now,
+    )?;
+    log_action(
+        &state.db_path,
+        case_id,
+        "final_report_approved",
+        &info.file_path,
+        &format!(
+            "Végleges riport kiadva: v{}, jóváhagyta: {}, pillanatkép SHA-256: {}.",
+            info.version, info.approved_by, info.snapshot_hash
+        ),
+    )?;
+    Ok(info)
+}
+
+#[tauri::command]
+fn get_report_versions(
+    state: tauri::State<'_, DbState>,
+    case_id: i64,
+) -> Result<Vec<release::VersionInfo>, String> {
+    let conn = get_connection(&state.db_path)?;
+    release::list_versions(&conn, case_id)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1510,7 +1753,9 @@ pub fn run() {
             inspect_source,
             export_sources,
             compare_search_runs,
-            save_report
+            save_report,
+            approve_final_report,
+            get_report_versions
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1576,6 +1821,155 @@ mod tests {
         assert!(table_has_column(&conn, "search_runs", "health").unwrap());
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM run_results", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    fn temp_db(tag: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("irbr_lib_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("irbr.db");
+        let path = db.to_string_lossy().into_owned();
+        let conn = get_connection(&path).unwrap();
+        init_schema(&conn).unwrap();
+        (dir, path)
+    }
+
+    fn make_case(path: &str, title: &str) -> i64 {
+        let conn = get_connection(path).unwrap();
+        conn.execute("INSERT INTO cases (title) VALUES (?1)", params![title]).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn make_run(path: &str, case_id: i64) -> i64 {
+        let conn = get_connection(path).unwrap();
+        conn.execute(
+            "INSERT INTO search_runs (case_id, created_at, summary, base_query, engine, tier_filter, plan_count, result_count)
+             VALUES (?1, 't', 's', 'q', 'e', 0, 1, 1)",
+            params![case_id],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn input(case_id: i64, run: Option<i64>, content: &str) -> ArchiveInput {
+        ArchiveInput {
+            case_id,
+            search_run_id: run,
+            title: "Cikk".into(),
+            url: "https://example.hu/a".into(),
+            tier: 3,
+            content: content.into(),
+            published_at: None,
+            modified_at: None,
+            time_source: None,
+            capture_kind: Some("kijelolt_szoveg".into()),
+            capture_truncated: false,
+        }
+    }
+
+    #[test]
+    fn archive_refuses_another_cases_run_and_leaves_no_orphan_file() {
+        // az audit 1. hibája: A ügy futama + B ügy azonosítója
+        let (dir, path) = temp_db("cross");
+        let a = make_case(&path, "A ügy");
+        let b = make_case(&path, "B ügy");
+        let run_a = make_run(&path, a);
+
+        let error = store_source(&path, input(b, Some(run_a), "A ügy találata")).unwrap_err();
+        assert!(error.contains("másik ügyhöz"), "{error}");
+        let files = fs::read_dir(dir.join("archive")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(files, 0, "nem maradhat fájl rekord nélkül");
+        let rows: i64 = get_connection(&path).unwrap().query_row("SELECT COUNT(*) FROM sources", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0);
+
+        // nem létező ügy és nem létező futam is elutasítva
+        assert!(store_source(&path, input(99, None, "x")).is_err());
+        assert!(store_source(&path, input(a, Some(999), "x")).is_err());
+
+        // a saját futama rendben, a rögzítés módja megmarad
+        let saved = store_source(&path, input(a, Some(run_a), "kijelölt részlet")).unwrap();
+        assert_eq!((saved.case_id, saved.search_run_id), (a, Some(run_a)));
+        assert_eq!(saved.capture_kind, "kijelolt_szoveg");
+        assert!(Path::new(&saved.file_path).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_never_overwrites_files_created_in_the_same_millisecond() {
+        let (dir, path) = temp_db("unique");
+        let a = make_case(&path, "A");
+        let first = store_source(&path, input(a, None, "egy")).unwrap();
+        let mut paths = vec![first.file_path.clone()];
+        for i in 0..20 {
+            paths.push(store_source(&path, input(a, None, &format!("tartalom {i}"))).unwrap().file_path);
+        }
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "minden forrásnak saját fájlja van");
+        assert_eq!(fs::read_to_string(&first.file_path).unwrap(), "egy");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_case_removes_run_results_and_issued_versions_with_their_files() {
+        let (dir, path) = temp_db("delete");
+        let a = make_case(&path, "Törlendő");
+        let b = make_case(&path, "Megmaradó");
+        let run_a = make_run(&path, a);
+        let run_b = make_run(&path, b);
+        let conn = get_connection(&path).unwrap();
+        conn.execute("INSERT INTO run_results (run_id, url_key, url) VALUES (?1, 'k', 'https://a.hu')", params![run_a]).unwrap();
+        conn.execute("INSERT INTO run_results (run_id, url_key, url) VALUES (?1, 'k', 'https://b.hu')", params![run_b]).unwrap();
+        let report = dir.join("reports").join("v1.md");
+        fs::create_dir_all(report.parent().unwrap()).unwrap();
+        fs::write(&report, "kiadott").unwrap();
+        conn.execute(
+            "INSERT INTO report_versions (case_id, version, approved_by, approved_at, final_opinion, snapshot, snapshot_hash, content, content_hash, file_path)
+             VALUES (?1, 1, 'Dr. T', 't', 'k', '{}', 'h', 'c', 'h', ?2)",
+            params![a, report.to_string_lossy()],
+        )
+        .unwrap();
+        // kiadott verzió élő ügynél nem törölhető
+        assert!(conn.execute("DELETE FROM report_versions WHERE case_id = ?1", params![a]).is_err());
+        drop(conn);
+
+        remove_case(&path, a).unwrap();
+        let conn = get_connection(&path).unwrap();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM run_results WHERE url = 'https://a.hu'"), 0, "nem maradhat árva futam-találat");
+        assert_eq!(count("SELECT COUNT(*) FROM run_results WHERE url = 'https://b.hu'"), 1, "a másik ügy érintetlen");
+        assert_eq!(count("SELECT COUNT(*) FROM report_versions"), 0);
+        assert!(!report.exists(), "a kiadott fájl is törlődik");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_v3_lists_legacy_mismatches_and_reinstalls_guards() {
+        let (dir, path) = temp_db("migrate");
+        let a = make_case(&path, "A");
+        let b = make_case(&path, "B");
+        let run_a = make_run(&path, a);
+        let conn = get_connection(&path).unwrap();
+        // v2 állapot szimulálása: nincsenek triggerek, és van egy régi, ellentmondó rekord
+        for name in ["trg_sources_run_same_case_ins", "trg_sources_run_same_case_upd"] {
+            conn.execute(&format!("DROP TRIGGER {name}"), []).unwrap();
+        }
+        conn.execute("INSERT INTO sources (case_id, search_run_id, title) VALUES (?1, ?2, 'régi idegen')", params![b, run_a]).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+
+        migrate_schema(&conn).unwrap();
+
+        let (case, action): (i64, String) = conn
+            .query_row("SELECT case_id, action_type FROM audit_logs WHERE action_type = 'integrity_legacy_mismatch'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((case, action.as_str()), (b, "integrity_legacy_mismatch"));
+        let kept: i64 = conn.query_row("SELECT case_id FROM sources WHERE title = 'régi idegen'", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept, b, "a régi rekord nem módosul");
+        // az új ellentmondó mentés már nem megy át
+        assert!(conn.execute("INSERT INTO sources (case_id, search_run_id, title) VALUES (?1, ?2, 'új idegen')", params![b, run_a]).is_err());
+        // és a lépés ismételhető
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        migrate_schema(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
