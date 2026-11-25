@@ -25,6 +25,22 @@ const viewport = ref(null);
 const addressInput = ref("");
 const searchInput = ref(props.initialQuery);
 const platformsOpen = ref(false);
+const SELECTION_KEY = "irbr-selection-only";
+function loadSelectionOnly() {
+  try {
+    return localStorage.getItem(SELECTION_KEY) !== "0"; // alapból csak a kijelölt szöveg
+  } catch {
+    return true;
+  }
+}
+const selectionOnly = ref(loadSelectionOnly());
+watch(selectionOnly, (value) => {
+  try {
+    localStorage.setItem(SELECTION_KEY, value ? "1" : "0");
+  } catch {
+    // csak kényelmi beállítás
+  }
+});
 const isEnabled = (id) => props.enabledIds.length === 0 || props.enabledIds.includes(id);
 const enabledCount = computed(() => props.platforms.filter((p) => isEnabled(p.id)).length);
 function submitSearch() {
@@ -247,11 +263,15 @@ async function run(action) {
         />
       </div>
 
+      <label class="flex items-center gap-1.5 whitespace-nowrap text-xs font-semibold text-slate-700" title="Bepipálva csak az oldalon kijelölt szöveg kerül az archívumba (nem a teljes oldal).">
+        <input v-model="selectionOnly" type="checkbox" class="accent-sky-600" />
+        Csak a kijelölt szöveg
+      </label>
       <button
         class="flex h-8 items-center gap-1.5 rounded-full bg-sky-50 px-3 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-30"
         :disabled="!activeTab"
-        title="Az oldal archiválása az aktív ügyhöz"
-        @click="emit('archive', activeTab)"
+        :title="selectionOnly ? 'Az oldalon kijelölt szöveg archiválása az aktív ügyhöz' : 'A teljes oldal szövegének archiválása az aktív ügyhöz'"
+        @click="emit('archive', activeTab, selectionOnly)"
       >⬇ Archiválás</button>
 
       <!-- Betöltési csík -->

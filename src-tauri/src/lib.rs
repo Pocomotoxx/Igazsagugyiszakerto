@@ -1943,6 +1943,47 @@ mod tests {
     }
 
     #[test]
+    fn two_sample_cases_stay_separate_through_archive_and_final_release() {
+        // az audit javasolt mintaügyei: két ügy, ügyenként saját kereséssel és felismerhető melléklettel
+        let (dir, path) = temp_db("samples");
+        let metszes = make_case(&path, "Ültetvény metszése");
+        let takaritas = make_case(&path, "Takarítási díj");
+        let run_m = make_run(&path, metszes);
+        let run_t = make_run(&path, takaritas);
+
+        let m = store_source(&path, input(metszes, Some(run_m), "MUNKANAPLÓ: 12 óra metszés")).unwrap();
+        let t = store_source(&path, input(takaritas, Some(run_t), "DÍJJEGYZÉK: 2 500 Ft/óra")).unwrap();
+        // keresztbe nem menthető
+        assert!(store_source(&path, input(metszes, Some(run_t), "idegen")).is_err());
+        assert!(store_source(&path, input(takaritas, Some(run_m), "idegen")).is_err());
+
+        let conn = get_connection(&path).unwrap();
+        for id in [m.id, t.id] {
+            conn.execute(
+                "UPDATE sources SET source_status = 'validalt', usability_decision = 'felhasznalhato', proof_summary = 'alátámasztja', reviewer_name = 'Dr. Minta', reviewed_at = '2026-02-01' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE cases SET report_status = 'veglegesitett', finalizable = 'igen', final_opinion = 'A metszés értéke 480 000 Ft.', open_questions = '' WHERE id = ?1",
+            params![metszes],
+        )
+        .unwrap();
+
+        let reports = dir.join("reports");
+        let info = release::approve(&conn, &archive_dir_for(&path), &reports, metszes, "Dr. Minta Szakértő", "# Riport\nA metszés értéke 480 000 Ft.\n", "2026-03-01 09:00:00").unwrap();
+        let issued = fs::read_to_string(&info.file_path).unwrap();
+        assert!(issued.contains("MUNKANAPLÓ") || issued.contains(&m.hash), "a saját melléklet szerepel a záradékban");
+        assert!(issued.contains(&m.hash));
+        assert!(!issued.contains(&t.hash), "a másik ügy melléklete nem kerülhet a kiadásba");
+        // a másik ügy nem véglegesített, tehát nem adható ki
+        assert!(release::approve(&conn, &archive_dir_for(&path), &reports, takaritas, "Dr. Minta Szakértő", "# Riport", "2026-03-01 09:00:00").is_err());
+        assert!(release::list_versions(&conn, takaritas).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn migration_v3_lists_legacy_mismatches_and_reinstalls_guards() {
         let (dir, path) = temp_db("migrate");
         let a = make_case(&path, "A");

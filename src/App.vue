@@ -6,7 +6,8 @@ import HelpTooltip from "./components/HelpTooltip.vue";
 import SourceReviewPanel from "./components/SourceReviewPanel.vue";
 import BrowserPanel from "./components/BrowserPanel.vue";
 import HistoryPanel from "./components/HistoryPanel.vue";
-import { captureTab, closeSearchTabs, openTab as openBrowserTab } from "./browserStore.js";
+import { captureTab, closeSearchTabs, closeTabsNotOf, openTab as openBrowserTab } from "./browserStore.js";
+import { beginOperation, CaseChangedError } from "./caseGuard.js";
 
 const allTabs = [
   { id: "demo", label: "Bemutató", advanced: true },
@@ -48,7 +49,6 @@ const currentTab = ref("cases");
 const sources = ref([]);
 const auditLogs = ref([]);
 const searchRuns = ref([]);
-const activeSearchRunId = ref(null);
 const archiveRunFilter = ref("all");
 const archiveStatusFilter = ref("all");
 const archiveDecisionFilter = ref("all");
@@ -120,10 +120,14 @@ onMounted(async () => {
 });
 
 watch(currentCase, async (value) => {
+  // a böngészőfül az ügyéhez kötött: ügyváltáskor a másik ügy fülei bezáródnak
+  notice.value = "";
+  closeTabsNotOf(value?.id ?? null);
   if (!value) {
     sources.value = [];
     auditLogs.value = [];
     searchRuns.value = [];
+    reportVersions.value = [];
     caseOpinionDraft.value = {
       preliminary_opinion: "",
       final_opinion: "",
@@ -134,7 +138,7 @@ watch(currentCase, async (value) => {
     };
     return;
   }
-  await Promise.all([loadSources(), loadAuditLogs(), loadSearchRuns()]);
+  await Promise.all([loadSources(), loadAuditLogs(), loadSearchRuns(), loadReportVersions()]);
   caseOpinionDraft.value = {
     preliminary_opinion: value.preliminary_opinion || "",
     final_opinion: value.final_opinion || "",
@@ -369,11 +373,21 @@ function buildQualityChecks() {
     issues.push(`Hiányos validálási metaadat ${unreviewedValidated.length} validált forrásnál.`);
   }
 
-  if (caseOpinionDraft.value.finalizable === "igen" && !caseOpinionDraft.value.final_opinion?.trim()) {
-    issues.push("Az ügy véglegesíthetőnek van jelölve, de nincs végleges szakértői konklúzió.");
+  // ugyanazok a szabályok, mint a háttérrendszerben (release::finalization_issues); a felület csak előzetesen jelez
+  const wantsFinal = caseOpinionDraft.value.report_status === "veglegesitett";
+  if ((wantsFinal || caseOpinionDraft.value.finalizable === "igen") && !caseOpinionDraft.value.final_opinion?.trim()) {
+    issues.push("Nincs végleges szakértői konklúzió.");
   }
 
-  if (caseOpinionDraft.value.report_status === "veglegesitett" && caseOpinionDraft.value.open_questions?.trim()) {
+  if (wantsFinal && caseOpinionDraft.value.finalizable !== "igen") {
+    issues.push("A riport véglegesített állapotú, de az ügy nincs „véglegesíthető” jelölésűre állítva.");
+  }
+
+  if (wantsFinal && !sources.value.some((source) => source.usability_decision === "felhasznalhato")) {
+    issues.push("Nincs felhasználhatónak jelölt forrás, a konklúziónak nincs alátámasztása.");
+  }
+
+  if (wantsFinal && caseOpinionDraft.value.open_questions?.trim()) {
     issues.push("A riport véglegesített állapotú, de maradtak nyitott kérdések.");
   }
 
@@ -381,6 +395,13 @@ function buildQualityChecks() {
 }
 
 const qualityChecks = computed(() => buildQualityChecks());
+
+// A riportszövegben nem szerepelhet „Véglegesített", ha a véglegesítés feltételei nem teljesülnek.
+const reportStatusLabel = computed(() =>
+  caseOpinionDraft.value.report_status === "veglegesitett" && qualityChecks.value.length > 0
+    ? "Tervezet (a véglegesítés feltételei nem teljesülnek)"
+    : formatReportStatus(caseOpinionDraft.value.report_status),
+);
 
 const highlightedSources = computed(() =>
   sources.value
@@ -472,7 +493,7 @@ const executiveSummary = computed(() => {
     "Még nincs rögzített összefoglaló álláspont.";
 
   return [
-    `Riport státusz: ${formatReportStatus(caseOpinionDraft.value.report_status)}.`,
+    `Riport státusz: ${reportStatusLabel.value}.`,
     `Végleges állásfoglalásra alkalmas: ${formatFinalizable(caseOpinionDraft.value.finalizable)}.`,
     `Felhasználható források: ${highlightedSources.value.length}, validált források: ${validatedSources.value.length}.`,
     `Nyitott kérdések: ${caseSummary.value.gaps.length || 0}, kizárandó források: ${excludedSources.value.length}.`,
@@ -543,7 +564,7 @@ const reportText = computed(() => {
     `- Riport dátuma: ${now}`,
     `- Határidő: ${currentCase.value.deadline || "nincs megadva"}`,
     `- Ügyállapot: ${currentCase.value.status}`,
-    `- Riport státusza: ${formatReportStatus(caseOpinionDraft.value.report_status)}`,
+    `- Riport státusza: ${reportStatusLabel.value}`,
     `- Végleges állásfoglalásra alkalmas: ${formatFinalizable(caseOpinionDraft.value.finalizable)}`,
     "",
     "## 2. Vezetői kivonat",
@@ -612,7 +633,7 @@ const reportText = computed(() => {
 
   lines.push("");
   lines.push("## 7. Szakértői konklúzió");
-  lines.push(`- Riport státusz: ${formatReportStatus(caseOpinionDraft.value.report_status)}`);
+  lines.push(`- Riport státusz: ${reportStatusLabel.value}`);
   lines.push(`- Végleges állásfoglalásra alkalmas: ${formatFinalizable(caseOpinionDraft.value.finalizable)}`);
   lines.push("### 7.1. Előzetes álláspont");
   lines.push(
@@ -871,7 +892,10 @@ async function loadCases() {
 
 async function loadSources() {
   if (!currentCase.value) return;
-  sources.value = await api("get_sources", { caseId: currentCase.value.id });
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  const loaded = await api("get_sources", { caseId: op.caseId });
+  if (!op.same()) return; // késői válasz nem írhatja felül a másik ügy állapotát
+  sources.value = loaded;
   sourceReviewDrafts.value = Object.fromEntries(
     sources.value.map((source) => [
       source.id,
@@ -892,12 +916,16 @@ async function loadSources() {
 
 async function loadAuditLogs() {
   if (!currentCase.value) return;
-  auditLogs.value = await api("get_audit_logs", { caseId: currentCase.value.id });
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  const loaded = await api("get_audit_logs", { caseId: op.caseId });
+  if (op.same()) auditLogs.value = loaded;
 }
 
 async function loadSearchRuns() {
   if (!currentCase.value) return;
-  searchRuns.value = await api("get_search_runs", { caseId: currentCase.value.id });
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  const loaded = await api("get_search_runs", { caseId: op.caseId });
+  if (op.same()) searchRuns.value = loaded;
 }
 
 async function handleCreateCase() {
@@ -1021,15 +1049,19 @@ async function runBrowserSearch(query) {
   appError.value = "";
   notice.value = "";
   rawQuery.value = query;
+  // az ügy az indításkor rögzül; minden várakozás után ellenőrizzük, hogy nem váltottak-e ügyet
+  const op = beginOperation(() => currentCase.value?.id ?? null);
   try {
     const links = await api("browser_tab_links", { query, enabledPlatforms: enabledPlatforms.value });
+    op.assertSame();
     if (links.length === 0) {
       appError.value = "Nincs bekapcsolt platform. Kapcsolj be legalább egyet a Platformok menüben.";
       return;
     }
     await closeSearchTabs();
-    activeSearchRunId.value = await api("record_search_run", {
-      caseId: currentCase.value.id,
+    op.assertSame();
+    const runId = await api("record_search_run", {
+      caseId: op.caseId,
       summary: `Böngészős keresés: ${query}. Platformok: ${links.length}. Találatok: ${links.length}. Keresési terv-lépések: ${links.length}.`,
       baseQuery: query,
       engine: `böngésző | ${enabledPlatforms.value.length ? enabledPlatforms.value.join(", ") : "minden platform"}`,
@@ -1048,8 +1080,10 @@ async function runBrowserSearch(query) {
       })),
     });
     for (let index = 0; index < links.length; index += 1) {
+      op.assertSame();
       await openBrowserTab({
-        caseId: currentCase.value.id,
+        caseId: op.caseId,
+        runId,
         url: links[index].url,
         title: links[index].label,
         kind: "search",
@@ -1059,42 +1093,70 @@ async function runBrowserSearch(query) {
     }
     await Promise.all([loadAuditLogs(), loadSearchRuns()]);
   } catch (error) {
+    if (error instanceof CaseChangedError) {
+      searchWarning.value = "A keresés megszakadt, mert közben ügyet váltottál. Indítsd újra az ügyben, ahová szánod.";
+      await closeTabsNotOf(currentCase.value?.id ?? null);
+      return;
+    }
     appError.value = `A böngészős keresés nem indítható: ${String(error)}`;
   }
 }
 
-async function archiveBrowserTab(tab) {
+async function archiveBrowserTab(tab, selectionOnly = false) {
   if (!tab || !currentCase.value) return;
   notice.value = "";
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  if (tab.caseId !== op.caseId) {
+    appError.value = "Ez a fül másik ügyhöz tartozik, ezért nem archiválható az aktív ügyhöz.";
+    return;
+  }
   try {
-    const page = await captureTab(tab.id);
+    const page = await captureTab(tab.id, selectionOnly);
+    op.assertSame();
+    if (page.empty_selection) {
+      appError.value = "Nincs kijelölt szöveg. Jelöld ki az oldalon az archiválandó részt, vagy vedd ki a pipát a teljes oldal mentéséhez.";
+      return;
+    }
     const url = page.url || tab.url;
     const title = page.title || tab.title || url;
+    const kind = page.kind === "kijelolt_szoveg" ? "kijelolt_szoveg" : "teljes_oldal";
     const content = [
       `Cím: ${title}`,
       `URL: ${url}`,
       `Fül: ${tab.kind === "search" ? tab.title : "kézzel megnyitott oldal"}`,
       `Lekérdezés: ${rawQuery.value || ""}`,
       "Forrás: beépített böngésző (az oldal megjelenített szövege, ahogy a felhasználó látta)",
+      kind === "kijelolt_szoveg"
+        ? "Rögzítés módja: KIJELÖLT SZÖVEGRÉSZLET (nem a teljes oldal)"
+        : "Rögzítés módja: teljes oldal szövege",
+      page.truncated ? "FIGYELEM: a rögzített szöveg a 20 000 karakteres korlát miatt csonka." : "",
       page.published ? `Közzétéve (oldal jelzése): ${page.published}` : "",
       "",
-      "--- Megjelenített oldaltartalom ---",
+      kind === "kijelolt_szoveg" ? "--- Kijelölt szöveg ---" : "--- Megjelenített oldaltartalom ---",
       page.text || "(az oldalról nem olvasható ki szöveg)",
     ].join("\n");
     await api("archive_source", {
-      caseId: currentCase.value.id,
-      searchRunId: activeSearchRunId.value,
+      caseId: op.caseId,
+      searchRunId: tab.runId ?? null,
       title,
       url,
       tier: 3,
       publishedAt: page.published || null,
       modifiedAt: page.modified || null,
       timeSource: page.published || page.modified ? "meta" : null,
+      captureKind: kind,
+      captureTruncated: Boolean(page.truncated),
       content,
     });
-    await Promise.all([loadSources(), loadAuditLogs()]);
-    notice.value = `Archiválva: ${title}`;
+    if (op.same()) {
+      await Promise.all([loadSources(), loadAuditLogs()]);
+      notice.value = kind === "kijelolt_szoveg" ? `Kijelölt szöveg archiválva: ${title}` : `Archiválva: ${title}`;
+    }
   } catch (error) {
+    if (error instanceof CaseChangedError) {
+      appError.value = "Az archiválás megszakadt, mert közben ügyet váltottál. Nem mentődött semmi.";
+      return;
+    }
     appError.value = `Az oldal archiválása sikertelen: ${String(error)}`;
   }
 }
@@ -1121,25 +1183,88 @@ async function openArchivedFile(source) {
 async function saveReport() {
   if (!currentCase.value) return;
 
-  const qualityIssues = buildQualityChecks();
-  if (qualityIssues.length > 0) {
-    appError.value = `Riport export blokkolva: ${qualityIssues.join(" | ")}`;
-    return;
-  }
-
+  // a tervezet szabadon exportálható (a háttérrendszer „TERVEZET" jelöléssel menti); a végleges kiadás külön, jóváhagyással készül
   isSavingReport.value = true;
   reportSaved.value = false;
+  const op = beginOperation(() => currentCase.value?.id ?? null);
   try {
-    reportPath.value = await api("save_report", {
-      caseId: currentCase.value.id,
+    const path = await api("save_report", {
+      caseId: op.caseId,
       reportContent: reportText.value,
     });
+    if (!op.same()) return;
+    reportPath.value = path;
     reportSaved.value = true;
     await loadAuditLogs();
   } catch (error) {
     appError.value = `Riportmentési hiba: ${String(error)}`;
   } finally {
     isSavingReport.value = false;
+  }
+}
+
+const reportVersions = ref([]);
+const approverName = ref("");
+const approvingFinal = ref(false);
+
+async function loadReportVersions() {
+  if (!currentCase.value) {
+    reportVersions.value = [];
+    return;
+  }
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  try {
+    const loaded = await api("get_report_versions", { caseId: op.caseId });
+    if (op.same()) reportVersions.value = loaded;
+  } catch (error) {
+    appError.value = `A kiadott verziók nem tölthetők be: ${String(error)}`;
+  }
+}
+
+// A végleges kiadás csak mentett állapotból készülhet: a szerkesztett mezők egyezzenek a mentettel.
+const opinionUnsaved = computed(() => {
+  const saved = currentCase.value;
+  if (!saved) return false;
+  const draft = caseOpinionDraft.value;
+  return (
+    (draft.final_opinion || "") !== (saved.final_opinion || "") ||
+    (draft.report_status || "tervezet") !== (saved.report_status || "tervezet") ||
+    (draft.finalizable || "nem") !== (saved.finalizable || "nem") ||
+    (draft.open_questions || "") !== (saved.open_questions || "") ||
+    (draft.closed_points || "") !== (saved.closed_points || "") ||
+    (draft.preliminary_opinion || "") !== (saved.preliminary_opinion || "")
+  );
+});
+
+const finalReleaseBlockers = computed(() => {
+  const blockers = [...qualityChecks.value];
+  if (caseOpinionDraft.value.report_status !== "veglegesitett") {
+    blockers.push("Az ügy riport-státusza nem „véglegesített” (állítsd be és mentsd az álláspontot).");
+  }
+  if (opinionUnsaved.value) blockers.push("Mentetlen módosítás van az ügy álláspontjában: előbb mentsd.");
+  if (approverName.value.trim().length < 3) blockers.push("Add meg a jóváhagyó szakértő nevét.");
+  return blockers;
+});
+
+async function approveFinalReport() {
+  if (!currentCase.value || finalReleaseBlockers.value.length > 0) return;
+  if (!confirm("Jóváhagyod a végleges kiadást? A kiadott verzió változtathatatlan, és a mellékletek és értékelések pontos állapotát rögzíti.")) return;
+  approvingFinal.value = true;
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  try {
+    const info = await api("approve_final_report", {
+      caseId: op.caseId,
+      approverName: approverName.value.trim(),
+      reportContent: reportText.value,
+    });
+    if (op.same()) {
+      notice.value = `Végleges riport kiadva: v${info.version} (${info.approved_by}).`;
+      await Promise.all([loadReportVersions(), loadAuditLogs()]);
+    }
+  } catch (error) {
+    appError.value = `A végleges kiadás nem készülhet el: ${String(error)}`;
+  } finally {
+    approvingFinal.value = false;
   }
 }
 
@@ -1900,8 +2025,46 @@ function tierBadgeClass(tier) {
               :disabled="isSavingReport || !currentCase"
               class="mt-6 w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:opacity-60"
             >
-              {{ isSavingReport ? "Mentés..." : "Markdown riport mentése" }}
+              {{ isSavingReport ? "Mentés..." : "Tervezet mentése (nem végleges)" }}
             </button>
+            <p class="mt-2 text-xs leading-5 text-slate-500">
+              A tervezet bármikor exportálható, a fájl „TERVEZET – nem végleges kiadás" jelölést kap.
+            </p>
+
+            <div class="mt-6 rounded-3xl border-2 border-slate-900/10 bg-white/90 p-4">
+              <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Végleges kiadás</div>
+              <p class="mt-2 text-xs leading-5 text-slate-600">
+                Csak mentett, „véglegesített" ügyállapotból készül, a szakértő saját jóváhagyásával. A kiadott verzió változtathatatlan, és rögzíti a felhasznált mellékletek és értékelések pontos állapotát.
+              </p>
+              <label class="mt-3 grid gap-1 text-xs font-semibold text-slate-700">
+                Jóváhagyó szakértő neve
+                <input v-model="approverName" placeholder="pl. Dr. Minta Szakértő" class="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+              <ul v-if="finalReleaseBlockers.length" class="mt-3 grid gap-1 text-xs leading-5 text-amber-800">
+                <li v-for="item in finalReleaseBlockers" :key="item">• {{ item }}</li>
+              </ul>
+              <button
+                @click="approveFinalReport"
+                :disabled="approvingFinal || !currentCase || finalReleaseBlockers.length > 0"
+                class="mt-3 w-full rounded-2xl bg-emerald-700 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:opacity-50"
+              >
+                {{ approvingFinal ? "Kiadás..." : "Végleges kiadás jóváhagyása" }}
+              </button>
+
+              <div v-if="reportVersions.length" class="mt-4 grid gap-2">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Kiadott verziók</div>
+                <article v-for="version in reportVersions" :key="version.id" class="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs">
+                  <div class="flex items-center justify-between gap-2">
+                    <strong>v{{ version.version }}</strong>
+                    <span :class="version.file_state === 'ok' ? 'text-emerald-700' : 'text-rose-700'" class="font-semibold">
+                      fájl: {{ version.file_state === "ok" ? "ép" : version.file_state }}
+                    </span>
+                  </div>
+                  <div class="mt-1 text-slate-600">{{ version.approved_by }} · {{ version.approved_at }}</div>
+                  <div class="mt-1 break-all font-mono text-[10px] text-slate-500">pillanatkép: {{ version.snapshot_hash }}</div>
+                </article>
+              </div>
+            </div>
 
             <div v-if="reportSaved" class="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
               Riport mentve: <span class="break-all font-mono text-xs">{{ reportPath }}</span>

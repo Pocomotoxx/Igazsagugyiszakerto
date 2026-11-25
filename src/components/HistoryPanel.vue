@@ -59,7 +59,7 @@ function resetFilters() {
 }
 
 async function open(item) {
-  inspection.value = await call("inspect_source", { sourceId: item.id });
+  inspection.value = await call("inspect_source", { caseId: props.caseId, sourceId: item.id });
 }
 
 async function exportNow() {
@@ -86,7 +86,7 @@ async function compare() {
     emit("error", "Válassz két különböző keresési futamot az összehasonlításhoz.");
     return;
   }
-  delta.value = await call("compare_search_runs", { runA: compareA.value, runB: compareB.value });
+  delta.value = await call("compare_search_runs", { caseId: props.caseId, runA: compareA.value, runB: compareB.value });
 }
 
 const fmt = (value) => value || "—";

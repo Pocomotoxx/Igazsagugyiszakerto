@@ -6,7 +6,6 @@ const LABEL_PREFIX = "browser-";
 const pending = new Map();
 
 export const browser = reactive({
-  caseId: null,
   tabs: [],
   activeId: null,
   bounds: { x: 0, y: 0, width: 800, height: 600 },
@@ -82,7 +81,7 @@ async function ensureCreated(tab) {
   tab.slow = false;
   try {
     await invoke("browser_open_tab", {
-      caseId: browser.caseId,
+      caseId: tab.caseId ?? null,
       tabId: tab.id,
       url: tab.url,
       ...browser.bounds,
@@ -110,11 +109,13 @@ export async function retryTab(tabId) {
   await activateTab(tabId);
 }
 
-export async function openTab({ caseId, url, title, kind = "page", lazy = false, activate = true }) {
+export async function openTab({ caseId = null, runId = null, url, title, kind = "page", lazy = false, activate = true }) {
   await ensureListener();
   counter += 1;
-  browser.caseId = caseId;
   const tab = {
+    // a fül az ügyéhez és a futamához kötött (a fül ügye és futama nem keveredhet)
+    caseId,
+    runId,
     id: `t${Date.now().toString(36)}${counter}`,
     url,
     title: title || shortTitle(url),
@@ -159,7 +160,7 @@ export async function closeSearchTabs() {
 }
 
 /** Az aktív oldal megjelenített szövege és időadatai (archiváláshoz), a webview-ból kiolvasva. */
-export function captureTab(tabId) {
+export function captureTab(tabId, selectionOnly = false) {
   const tab = browser.tabs.find((item) => item.id === tabId);
   if (!tab || !tab.created) return Promise.reject(new Error("Az oldal még nincs betöltve."));
   return new Promise((resolve, reject) => {
@@ -171,7 +172,7 @@ export function captureTab(tabId) {
       clearTimeout(timer);
       resolve(data);
     });
-    invoke("browser_capture_text", { tabId }).catch((error) => {
+    invoke("browser_capture_text", { tabId, selectionOnly }).catch((error) => {
       clearTimeout(timer);
       pending.delete(tabId);
       reject(error);
@@ -211,4 +212,11 @@ export async function showActive() {
 export async function hideAll() {
   browser.mounted = false;
   await invoke("browser_hide_all").catch(() => {});
+}
+
+/** Ügyváltáskor bezárja a más ügyhöz tartozó fület. */
+export async function closeTabsNotOf(caseId) {
+  const ids = browser.tabs.filter((tab) => (tab.caseId ?? null) !== (caseId ?? null)).map((tab) => tab.id);
+  for (const id of ids) await closeTab(id, { activateNext: false });
+  if (!browser.tabs.some((tab) => tab.id === browser.activeId)) browser.activeId = null;
 }
