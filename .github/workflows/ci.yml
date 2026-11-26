@@ -16,6 +16,8 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run build
+      - name: Webes tesztek (ügyhatár, véglegesítés)
+        run: npm run test:web
 
   rust:
     runs-on: windows-latest

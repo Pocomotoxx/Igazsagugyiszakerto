@@ -316,3 +316,22 @@ Szabály:
 - a forráscsomagok már nem csak javasolt plusz futamokat adnak, hanem ténylegesen korlátozzák a natív és a valódi webes keresést
 - ha például csak a Facebook csoportok van bepipálva, akkor a query-builder és a backend megnyitási kártyák is csak ehhez a csomaghoz igazodnak
 - a felületen minden forráscsomag mellett látszik, pontosan mely domaineken keres az adott választás
+
+### M-Crucix - Előzmények, export, szolgáltatói idő, állapot-mátrix
+- Séma v2: `sources.published_at/modified_at/time_source`, `search_runs.health`, új `run_results` tábla.
+- Új modulok: `provenance`, `story`, `export`, `history`, `fetchx` (mind egységtesztelt).
+- Új parancsok: `search_history`, `inspect_source`, `export_sources`, `compare_search_runs`, `previous_run_delta`, `get_source_health`, `cluster_stories`.
+- Felület: Előzmények fül (Haladó mód), frissességi és történet-jelvények a találatokon, futam-különbség sáv, forrás-állapot chipek.
+
+
+### M-Platformok - egy kérés minden platformon
+- A keresőmotor- és forráscsomag-választás kikerült a keresési űrlapból; a kérés minden bekapcsolt platformon lefut.
+- Új modulok: `platforms` (lekérdezés-elemzés és platformonkénti igazítás), `rss` (10 magyar hírcsatorna lekérése és szűrése).
+- Új parancsok: `list_platforms`, `platform_links`; az `execute_search` kapott `enabled_platforms` paramétert.
+- Platformonkénti forrás-állapot sorok a mátrixban.
+
+### M-Takarítás - holt kód kivezetése
+- A korábbi API-s és kulcs nélküli keresés (Tavily, Brave, Google CSE, DuckDuckGo/Bing HTML, RSS, AI-javaslatok), az API-kulcs-kezelés (DPAPI) és a hozzá tartozó felület kikerült; a keresés a böngészőben történik.
+- Törölt Rust-modulok: `ddg`, `bing`, `scrape`, `rss`, `fetchx`; a `lib.rs` 4757 sorról kb. 1500-ra, az `App.vue` 3300 sorról kb. 1900-ra csökkent.
+- A `reqwest` függőség elhagyható lett.
+

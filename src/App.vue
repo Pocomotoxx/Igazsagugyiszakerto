@@ -1,58 +1,47 @@
 <script setup>
 import { computed, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import HelpTooltip from "./components/HelpTooltip.vue";
 import SourceReviewPanel from "./components/SourceReviewPanel.vue";
+import BrowserPanel from "./components/BrowserPanel.vue";
+import HistoryPanel from "./components/HistoryPanel.vue";
+import { captureTab, closeSearchTabs, closeTabsNotOf, openTab as openBrowserTab } from "./browserStore.js";
+import { beginOperation, CaseChangedError } from "./caseGuard.js";
 
-const tabs = [
-  { id: "demo", label: "Bemutató" },
+const allTabs = [
+  { id: "demo", label: "Bemutató", advanced: true },
   { id: "cases", label: "Ügyek" },
-  { id: "search", label: "Keresési Futam" },
+  { id: "browser", label: "Böngésző" },
   { id: "archive", label: "Archivum" },
-  { id: "audit", label: "Audit" },
+  { id: "history", label: "Előzmények", advanced: true },
+  { id: "audit", label: "Audit", advanced: true },
   { id: "report", label: "Riport" },
 ];
 
-const engines = [
-  { id: "google", label: "Google", note: "Széles recall, gyors első futam." },
-  { id: "bing", label: "Bing", note: "Eltérő indexelés, más találati sorrend." },
-  { id: "duckduckgo", label: "DuckDuckGo", note: "Más rangsorolás, jó kontrollkör." },
-];
+const UI_MODE_KEY = "irbr-ui-mode";
+function loadUiMode() {
+  try {
+    return localStorage.getItem(UI_MODE_KEY) === "advanced" ? "advanced" : "simple";
+  } catch {
+    return "simple";
+  }
+}
+const uiMode = ref(loadUiMode());
+const advanced = computed(() => uiMode.value === "advanced");
+const tabs = computed(() => allTabs.filter((tab) => advanced.value || !tab.advanced));
 
-const searchModes = [
-  { id: "native", label: "Natív böngésző alapú", note: "Kereső- és forrásnyitási terv; ha be van állítva keresési API (Tavily, CSE, Brave), valódi webes találatokkal kiegészítve." },
-  { id: "hybrid", label: "AI + natív böngésző", note: "A natív futamot (terv + valódi találatok) AI keresési javaslatokkal egészíti ki." },
-  { id: "ai_only", label: "Csak AI API", note: "A futam kizárólag AI-alapú keresési és ellenőrzési javaslatokat ad, keresési API-k nélkül." },
-];
-
-const aiProviders = [
-  { id: "openai", label: "OpenAI" },
-  { id: "openrouter", label: "OpenRouter" },
-  { id: "gemini", label: "Google Gemini" },
-];
-
-const nativeRunModes = [
-  { id: "broad", label: "Széles webes futam", note: "Minimális szűrés, valódi Google/Bing recall." },
-  { id: "filtered", label: "Szűrt szakértői futam", note: "Forráscsomagokkal és szakértői szűkítéssel." },
-  { id: "combined", label: "Kombinált futam", note: "Széles és szűrt futam együtt." },
-];
-
-const tierOptions = [
-  { value: 0, label: "Minden tier" },
-  { value: 1, label: "Csak Tier 1 - Hivatalos" },
-  { value: 2, label: "Tier 1-2 - Hivatalos és tudományos" },
-  { value: 3, label: "Tier 1-3 - Piaci / keresőig" },
-  { value: 4, label: "Tier 1-4 - Kontrollal együtt" },
-];
-
-const presets = [
-  { id: "haztartas", label: "Háztartási munka", must: "háztartási munka", phrase: "óradíj" },
-  { id: "gondozas", label: "Gondozás", must: "házi gondozás", phrase: "óradíj" },
-  { id: "takaritas", label: "Takarítás", must: "takarítás", phrase: "óradíj" },
-  { id: "bebi", label: "Bébiszitter", must: "bébiszitter", phrase: "óradíj" },
-  { id: "mezogazdasag", label: "Mezőgazdasági gépi munka", must: "mezőgazdasági gépi munka", phrase: "órabér" },
-];
+function setUiMode(mode) {
+  uiMode.value = mode;
+  try {
+    localStorage.setItem(UI_MODE_KEY, mode);
+  } catch {
+    // a mód csak kényelmi beállítás, mentés nélkül is működik
+  }
+  if (mode === "simple" && allTabs.find((tab) => tab.id === currentTab.value)?.advanced) {
+    currentTab.value = "cases";
+  }
+}
 
 const cases = ref([]);
 const currentCase = ref(null);
@@ -60,18 +49,11 @@ const currentTab = ref("cases");
 const sources = ref([]);
 const auditLogs = ref([]);
 const searchRuns = ref([]);
-const searchResults = ref([]);
-const selectedRunIds = ref([]);
-const activeSearchRunId = ref(null);
 const archiveRunFilter = ref("all");
 const archiveStatusFilter = ref("all");
 const archiveDecisionFilter = ref("all");
 const archivePriorityFilter = ref("all");
 const archiveOriginFilter = ref("all");
-const expandedResultKeys = ref({});
-const expandedRunIds = ref({});
-const searchPlanExpanded = ref(false);
-const runNoteDrafts = ref({});
 const sourceReviewDrafts = ref({});
 const caseOpinionDraft = ref({
   preliminary_opinion: "",
@@ -81,293 +63,56 @@ const caseOpinionDraft = ref({
   open_questions: "",
   closed_points: "",
 });
-const selectedEngines = ref(["google", "bing"]);
-const selectedTierFilter = ref(0);
-const isSearching = ref(false);
 const isSavingReport = ref(false);
-const busyArchiveId = ref(null);
 const reportPath = ref("");
 const reportSaved = ref(false);
-const lastSearchSummary = ref("");
 const appError = ref("");
 const searchWarning = ref("");
-const searchDiagnostics = ref(null);
+
+const PLATFORMS_KEY = "irbr-platforms";
+const platformList = ref([]);
+function loadEnabledPlatforms() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PLATFORMS_KEY) || "[]");
+    return Array.isArray(raw) ? raw.filter((id) => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+// üres lista = minden platform bekapcsolva
+const enabledPlatforms = ref(loadEnabledPlatforms());
+
+function togglePlatform(id) {
+  const all = platformList.value.map((p) => p.id);
+  let current = enabledPlatforms.value.length === 0 ? [...all] : [...enabledPlatforms.value];
+  current = current.includes(id) ? current.filter((item) => item !== id) : [...current, id];
+  if (current.length === 0) return; // legalább egy platform maradjon bekapcsolva
+  enabledPlatforms.value = current.length === all.length ? [] : current;
+  try {
+    localStorage.setItem(PLATFORMS_KEY, JSON.stringify(enabledPlatforms.value));
+  } catch {
+    // a beállítás csak kényelmi, mentés nélkül is működik
+  }
+}
 
 const newCaseTitle = ref("");
 const newCaseDesc = ref("");
 const newCaseDeadline = ref("");
 
-const searchTerms = ref({
-  mustInclude: "",
-  exactPhrase: "",
-  anyOf: "",
-  exclude: "",
-  site: "",
-  region: "",
-  yearFrom: "",
-  yearTo: "",
-});
 const rawQuery = ref("");
-const sourcePacks = ref({
-  official: true,
-  science: true,
-  market: true,
-  archive: true,
-  reddit: false,
-  facebook_groups: true,
-  shared: false,
-  community_general: false,
-  control: false,
-});
-const researchLens = ref("balanced");
-const searchMode = ref("native");
-const nativeRunMode = ref("combined");
-const settingsSaved = ref(false);
-const cseSettings = ref({
-  api_key: "",
-  api_key_set: false,
-  cx: "",
-});
-const braveSettings = ref({
-  api_key: "",
-  api_key_set: false,
-});
-const tavilySettings = ref({
-  api_key: "",
-  api_key_set: false,
-});
-const aiSettings = ref({
-  ai_provider: "openai",
-  api_key: "",
-  api_key_set: false,
-  ai_model: "gpt-4o-mini",
-  system_prompt:
-    "Te egy igazsagugyi szakerto munkajat tamogato kutatasi asszisztens vagy. Adj rovid, gyakorlatias keresesi javaslatokat, ellenorzesi szempontokat, keresokifejezes-variantokat es lehetoseg szerint relevans forrashelyeket. JSON formatumban valaszolj.",
-});
 
 async function api(command, args = {}) {
   return invoke(command, args);
 }
 
-const aiConfigured = computed(
-  () => aiSettings.value.api_key.trim().length > 0 || aiSettings.value.api_key_set,
-);
-
-const cseConfigured = computed(
-  () =>
-    cseSettings.value.cx.trim().length > 0 &&
-    (cseSettings.value.api_key.trim().length > 0 || cseSettings.value.api_key_set),
-);
-
-const braveConfigured = computed(
-  () => braveSettings.value.api_key.trim().length > 0 || braveSettings.value.api_key_set,
-);
-
-const tavilyConfigured = computed(
-  () => tavilySettings.value.api_key.trim().length > 0 || tavilySettings.value.api_key_set,
-);
-
-const sourcePackMeta = {
-  official: {
-    label: "Hivatalos",
-    domains: ["site:njt.hu", "site:magyarkozlony.hu", "site:ksh.hu", "site:kozbeszerzes.hu"],
-    info: "njt.hu, magyarkozlony.hu, ksh.hu, kozbeszerzes.hu",
-    note: "Jogszabályok, közlönyök, statisztikák és közbeszerzési értesítők.",
-  },
-  science: {
-    label: "Tudományos",
-    domains: ["site:scholar.google.com", "site:ncbi.nlm.nih.gov"],
-    info: "scholar.google.com, ncbi.nlm.nih.gov",
-    note: "Tudományos publikációk és módszertani háttéranyagok.",
-  },
-  market: {
-    label: "Piaci",
-    domains: ["site:profession.hu", "site:allasok.hu", "site:jooble.org"],
-    info: "profession.hu, allasok.hu, jooble.org",
-    note: "Munkaerőpiaci és piaci kontrollforrások.",
-  },
-  archive: {
-    label: "Webarchív",
-    domains: ["site:archive.org"],
-    info: "archive.org",
-    note: "Internet Archive és archivált dokumentumváltozatok.",
-  },
-  reddit: {
-    label: "Reddit kontroll",
-    domains: ["site:reddit.com"],
-    info: "reddit.com",
-    note: "Közösségi kontroll és gyakorlati tapasztalatok.",
-  },
-  facebook_groups: {
-    label: "Facebook csoportok",
-    domains: ["site:facebook.com/groups", "site:facebook.com"],
-    info: "facebook.com/groups, facebook.com",
-    note: "Nyilvánosan indexelt Facebook csoportok és oldalak.",
-  },
-  shared: {
-    label: "Megosztott",
-    domains: ["site:drive.google.com", "site:docs.google.com"],
-    info: "drive.google.com, docs.google.com",
-    note: "Megosztott dokumentumok, táblázatok és prezentációk.",
-  },
-  community_general: {
-    label: "Általános közösségi kontroll",
-    domains: ["site:facebook.com", "site:jofogas.hu"],
-    info: "facebook.com, jofogas.hu",
-    note: "Vegyes közösségi és piactéri kontrollréteg.",
-  },
-  control: {
-    label: "Vegyes kontroll",
-    domains: ["site:jofogas.hu", "site:facebook.com"],
-    info: "jofogas.hu, facebook.com",
-    note: "Gyors ellenőrző kontrollforrások.",
-  },
-};
-
-const sourcePackQueries = Object.fromEntries(
-  Object.entries(sourcePackMeta).map(([key, value]) => [key, value.domains]),
-);
-
-const selectedSourcePackKeys = computed(() =>
-  Object.entries(sourcePacks.value)
-    .filter(([, enabled]) => enabled)
-    .map(([key]) => key),
-);
-
-const selectedSourcePackSummary = computed(() => {
-  if (selectedSourcePackKeys.value.length === 0) {
-    return "Nincs forráscsomag kiválasztva, ezért a rendszer széles webes keresést használ.";
-  }
-
-  return selectedSourcePackKeys.value
-    .map((key) => {
-      const meta = sourcePackMeta[key];
-      return `${meta?.label || key}: ${meta?.info || ""}`;
-    })
-    .join(" | ");
-});
-
-async function loadAppSettings() {
-  const settings = await api("get_app_settings");
-  searchMode.value = settings.search_mode || "native";
-  aiSettings.value = {
-    ai_provider: settings.ai_provider || "openai",
-    api_key: "",
-    api_key_set: Boolean(settings.api_key_set),
-    ai_model: settings.ai_model || "gpt-4o-mini",
-    system_prompt: settings.system_prompt || aiSettings.value.system_prompt,
-  };
-  cseSettings.value = {
-    api_key: "",
-    api_key_set: Boolean(settings.google_cse_key_set),
-    cx: settings.google_cse_cx || "",
-  };
-  braveSettings.value = {
-    api_key: "",
-    api_key_set: Boolean(settings.brave_key_set),
-  };
-  tavilySettings.value = {
-    api_key: "",
-    api_key_set: Boolean(settings.tavily_key_set),
-  };
-}
-
-async function saveAppSettings() {
-  try {
-    await api("save_app_settings", {
-      searchMode: searchMode.value,
-      aiProvider: aiSettings.value.ai_provider,
-      apiKey: aiSettings.value.api_key,
-      aiModel: aiSettings.value.ai_model,
-      systemPrompt: aiSettings.value.system_prompt,
-      googleCseKey: cseSettings.value.api_key,
-      googleCseCx: cseSettings.value.cx,
-      braveKey: braveSettings.value.api_key,
-      tavilyKey: tavilySettings.value.api_key,
-    });
-    if (aiSettings.value.api_key.trim()) {
-      aiSettings.value.api_key_set = true;
-      aiSettings.value.api_key = "";
-    }
-    if (cseSettings.value.api_key.trim()) {
-      cseSettings.value.api_key_set = true;
-      cseSettings.value.api_key = "";
-    }
-    if (braveSettings.value.api_key.trim()) {
-      braveSettings.value.api_key_set = true;
-      braveSettings.value.api_key = "";
-    }
-    if (tavilySettings.value.api_key.trim()) {
-      tavilySettings.value.api_key_set = true;
-      tavilySettings.value.api_key = "";
-    }
-    settingsSaved.value = true;
-    appError.value = "";
-    setTimeout(() => {
-      settingsSaved.value = false;
-    }, 2500);
-  } catch (error) {
-    appError.value = `Beállítás mentési hiba: ${String(error)}`;
-  }
-}
-
-function buildYearClause(yearFrom, yearTo) {
-  const start = Number.parseInt(yearFrom, 10);
-  const end = Number.parseInt(yearTo, 10);
-
-  if (Number.isNaN(start) && Number.isNaN(end)) {
-    return "";
-  }
-
-  const currentYear = new Date().getFullYear();
-  const effectiveStart = Number.isNaN(start) ? null : start;
-  const effectiveEnd = Number.isNaN(end) ? null : end;
-
-  if (effectiveStart !== null && effectiveEnd !== null && effectiveEnd >= effectiveStart) {
-    if (effectiveEnd - effectiveStart <= 6) {
-      return `(${Array.from({ length: effectiveEnd - effectiveStart + 1 }, (_, index) => effectiveStart + index).join(" OR ")})`;
-    }
-    return `${effectiveStart}..${effectiveEnd}`;
-  }
-
-  if (effectiveStart !== null) {
-    if (currentYear - effectiveStart <= 6 && currentYear >= effectiveStart) {
-      return `(${Array.from({ length: currentYear - effectiveStart + 1 }, (_, index) => effectiveStart + index).join(" OR ")})`;
-    }
-    return `after:${effectiveStart}`;
-  }
-
-  return `before:${effectiveEnd}`;
-}
-
-function buildExternalSearchUrl(engine, query) {
-  const encoded = encodeURIComponent(query);
-  if (engine === "bing") return `https://www.bing.com/search?q=${encoded}`;
-  if (engine === "duckduckgo") return `https://duckduckgo.com/?q=${encoded}`;
-  return `https://www.google.com/search?q=${encoded}`;
-}
-
-function buildFallbackSearchResults(query) {
-  return selectedEngines.value.map((engine) => ({
-    title: `${engines.find((item) => item.id === engine)?.label || engine} keresés indítása`,
-    url: buildExternalSearchUrl(engine, query),
-    original_url: "",
-    archived_url: "",
-    archive_kind: "live",
-    snapshot_timestamp: "",
-    snippet: "Védőháló találat: közvetlen keresőnyitás ugyanarra a lekérdezésre, ha a generált terv valamiért nem adott vissza kártyát.",
-    tier: 3,
-    source_type: "Keresőmotor",
-    relevance: 100,
-    query_used: query,
-    action_label: "Megnyitás",
-  }));
-}
-
 onMounted(async () => {
   try {
     await api("init_db");
-    await loadAppSettings();
+    try {
+      platformList.value = await api("list_platforms");
+    } catch {
+      platformList.value = [];
+    }
     await loadCases();
   } catch (error) {
     appError.value = `Inicializációs hiba: ${String(error)}`;
@@ -375,10 +120,14 @@ onMounted(async () => {
 });
 
 watch(currentCase, async (value) => {
+  // a böngészőfül az ügyéhez kötött: ügyváltáskor a másik ügy fülei bezáródnak
+  notice.value = "";
+  closeTabsNotOf(value?.id ?? null);
   if (!value) {
     sources.value = [];
     auditLogs.value = [];
     searchRuns.value = [];
+    reportVersions.value = [];
     caseOpinionDraft.value = {
       preliminary_opinion: "",
       final_opinion: "",
@@ -389,7 +138,7 @@ watch(currentCase, async (value) => {
     };
     return;
   }
-  await Promise.all([loadSources(), loadAuditLogs(), loadSearchRuns()]);
+  await Promise.all([loadSources(), loadAuditLogs(), loadSearchRuns(), loadReportVersions()]);
   caseOpinionDraft.value = {
     preliminary_opinion: value.preliminary_opinion || "",
     final_opinion: value.final_opinion || "",
@@ -398,154 +147,6 @@ watch(currentCase, async (value) => {
     open_questions: value.open_questions || "",
     closed_points: value.closed_points || "",
   };
-});
-
-const broadQuery = computed(() => {
-  if (rawQuery.value.trim()) {
-    return rawQuery.value.trim();
-  }
-
-  const parts = [];
-  if (searchTerms.value.mustInclude.trim()) {
-    parts.push(searchTerms.value.mustInclude.trim());
-  }
-  if (searchTerms.value.exactPhrase.trim()) {
-    parts.push(`"${searchTerms.value.exactPhrase.trim()}"`);
-  }
-  if (searchTerms.value.anyOf.trim()) {
-    parts.push(`(${searchTerms.value.anyOf.trim().split(/\s+/).join(" OR ")})`);
-  }
-  if (searchTerms.value.exclude.trim()) {
-    parts.push(
-      searchTerms.value.exclude
-        .trim()
-        .split(/\s+/)
-        .map((term) => `-${term}`)
-        .join(" "),
-    );
-  }
-  if (searchTerms.value.site.trim()) {
-    parts.push(`site:${searchTerms.value.site.trim()}`);
-  }
-  if (searchTerms.value.region.trim()) {
-    parts.push(searchTerms.value.region.trim());
-  }
-  const yearClause = buildYearClause(searchTerms.value.yearFrom.trim(), searchTerms.value.yearTo.trim());
-  if (yearClause) {
-    parts.push(yearClause);
-  }
-
-  return parts.join(" ").trim();
-});
-
-const constructedQuery = computed(() => broadQuery.value);
-
-const sourcePackLabels = {
-  official: "Hivatalos források",
-  science: "Tudományos források",
-  market: "Piaci források",
-  archive: "Webarchív",
-  reddit: "Reddit kontroll",
-  facebook_groups: "Facebook csoportok",
-  shared: "Megosztott dokumentumok",
-  community_general: "Általános közösségi",
-  control: "Kontrollforrások",
-};
-
-const lensClause = computed(() => {
-  if (researchLens.value === "pricing") {
-    return "(árlista OR óradíj OR bérkalkuláció OR díjtáblázat)";
-  }
-  if (researchLens.value === "legal") {
-    return "(jogszabály OR módszertan OR iránymutatás OR szakvélemény)";
-  }
-  if (researchLens.value === "operations") {
-    return "(költség OR normatíva OR üzemeltetés OR hatékonyság)";
-  }
-  return "";
-});
-
-function buildScopedBaseQuery() {
-  const base = broadQuery.value;
-  if (!base) return "";
-  return lensClause.value ? `${base} ${lensClause.value}` : base;
-}
-
-const filteredQueries = computed(() => {
-  const base = buildScopedBaseQuery();
-  if (!base) return [];
-
-  const queries = [];
-
-  if (searchTerms.value.site.trim()) {
-    queries.push({
-      label: "Cél domain",
-      query: base,
-      info: `Kézi domainkorlát: ${searchTerms.value.site.trim()}`,
-      note: "A keresés a kézzel megadott cél domainre van korlátozva.",
-    });
-  } else if (selectedSourcePackKeys.value.length > 0) {
-    selectedSourcePackKeys.value.forEach((key) => {
-      const terms = sourcePackQueries[key] || [];
-      const meta = sourcePackMeta[key] || {};
-      if (terms.length === 0) return;
-      queries.push({
-        label: meta.label || sourcePackLabels[key] || key,
-        query: `${base} (${terms.join(" OR ")})`,
-        info: meta.info || terms.join(", "),
-        note: meta.note || "Csak a kiválasztott forráscsomag oldalain futó keresés.",
-      });
-    });
-  } else {
-    queries.push({
-      label: "Széles webes futam",
-      query: base,
-      info: "Nincs forráscsomag-korlát",
-      note: "Széles webes keresés forráscsomag-szűkítés nélkül.",
-    });
-  }
-
-  const seen = new Set();
-  return queries.filter(({ query }) => {
-    if (seen.has(query) || query === base) return false;
-    seen.add(query);
-    return true;
-  });
-});
-
-const GOOGLE_WORD_LIMIT = 32;
-
-function countQueryWords(query) {
-  return query.split(/\s+/).filter(Boolean).length;
-}
-
-const queryWordWarnings = computed(() => {
-  const warnings = [];
-  if (broadQuery.value && countQueryWords(broadQuery.value) > GOOGLE_WORD_LIMIT) {
-    warnings.push(`A széles alaplekérdezés ${countQueryWords(broadQuery.value)} szóból áll.`);
-  }
-  filteredQueries.value.forEach(({ label, query }) => {
-    const count = countQueryWords(query);
-    if (count > GOOGLE_WORD_LIMIT) {
-      warnings.push(`A(z) "${label}" szűrt lekérdezés ${count} szóból áll.`);
-    }
-  });
-  return warnings;
-});
-
-const searchPlan = computed(() => {
-  if (filteredQueries.value.length === 0) return [];
-
-  const plans = [];
-  filteredQueries.value.forEach(({ label, query, info, note }) => {
-    plans.push({
-      title: `${plans.length + 1}. Forráskorlátozott futam: ${label}`,
-      note: `${note || "Csak a kiválasztott forráscsomag oldalain futó keresés."} Keresett oldalak: ${info || "nincs külön megadva"}.`,
-      query,
-    });
-  });
-
-  return plans;
 });
 
 const archiveInsights = computed(() => {
@@ -573,13 +174,6 @@ const archiveInsights = computed(() => {
     duplicatedDomains,
     missingTiers,
   };
-});
-
-const selectedRunComparison = computed(() => {
-  if (selectedRunIds.value.length < 2) return [];
-  return selectedRunIds.value
-    .map((id) => searchRuns.value.find((run) => run.id === id))
-    .filter(Boolean);
 });
 
 const archiveGroups = computed(() => {
@@ -739,10 +333,6 @@ function getOriginCaution(origin) {
   return "";
 }
 
-function isWaybackResult(result) {
-  return result.archive_kind === "wayback_snapshot" || result.archive_kind === "wayback_index";
-}
-
 function formatReportStatus(status) {
   if (status === "ellenorzes_alatt") return "Ellenőrzés alatt";
   if (status === "veglegesitett") return "Véglegesített";
@@ -751,33 +341,6 @@ function formatReportStatus(status) {
 
 function formatFinalizable(value) {
   return value === "igen" ? "Igen" : "Nem";
-}
-
-function getSearchResultKey(result) {
-  return `${result.url}-${result.query_used}`;
-}
-
-function isResultExpanded(result) {
-  return Boolean(expandedResultKeys.value[getSearchResultKey(result)]);
-}
-
-function toggleResultExpanded(result) {
-  const key = getSearchResultKey(result);
-  expandedResultKeys.value = {
-    ...expandedResultKeys.value,
-    [key]: !expandedResultKeys.value[key],
-  };
-}
-
-function isRunExpanded(runId) {
-  return Boolean(expandedRunIds.value[runId]);
-}
-
-function toggleRunExpanded(runId) {
-  expandedRunIds.value = {
-    ...expandedRunIds.value,
-    [runId]: !expandedRunIds.value[runId],
-  };
 }
 
 function applyQuickReview(source, patch) {
@@ -810,11 +373,21 @@ function buildQualityChecks() {
     issues.push(`Hiányos validálási metaadat ${unreviewedValidated.length} validált forrásnál.`);
   }
 
-  if (caseOpinionDraft.value.finalizable === "igen" && !caseOpinionDraft.value.final_opinion?.trim()) {
-    issues.push("Az ügy véglegesíthetőnek van jelölve, de nincs végleges szakértői konklúzió.");
+  // ugyanazok a szabályok, mint a háttérrendszerben (release::finalization_issues); a felület csak előzetesen jelez
+  const wantsFinal = caseOpinionDraft.value.report_status === "veglegesitett";
+  if ((wantsFinal || caseOpinionDraft.value.finalizable === "igen") && !caseOpinionDraft.value.final_opinion?.trim()) {
+    issues.push("Nincs végleges szakértői konklúzió.");
   }
 
-  if (caseOpinionDraft.value.report_status === "veglegesitett" && caseOpinionDraft.value.open_questions?.trim()) {
+  if (wantsFinal && caseOpinionDraft.value.finalizable !== "igen") {
+    issues.push("A riport véglegesített állapotú, de az ügy nincs „véglegesíthető” jelölésűre állítva.");
+  }
+
+  if (wantsFinal && !sources.value.some((source) => source.usability_decision === "felhasznalhato")) {
+    issues.push("Nincs felhasználhatónak jelölt forrás, a konklúziónak nincs alátámasztása.");
+  }
+
+  if (wantsFinal && caseOpinionDraft.value.open_questions?.trim()) {
     issues.push("A riport véglegesített állapotú, de maradtak nyitott kérdések.");
   }
 
@@ -822,6 +395,13 @@ function buildQualityChecks() {
 }
 
 const qualityChecks = computed(() => buildQualityChecks());
+
+// A riportszövegben nem szerepelhet „Véglegesített", ha a véglegesítés feltételei nem teljesülnek.
+const reportStatusLabel = computed(() =>
+  caseOpinionDraft.value.report_status === "veglegesitett" && qualityChecks.value.length > 0
+    ? "Tervezet (a véglegesítés feltételei nem teljesülnek)"
+    : formatReportStatus(caseOpinionDraft.value.report_status),
+);
 
 const highlightedSources = computed(() =>
   sources.value
@@ -913,7 +493,7 @@ const executiveSummary = computed(() => {
     "Még nincs rögzített összefoglaló álláspont.";
 
   return [
-    `Riport státusz: ${formatReportStatus(caseOpinionDraft.value.report_status)}.`,
+    `Riport státusz: ${reportStatusLabel.value}.`,
     `Végleges állásfoglalásra alkalmas: ${formatFinalizable(caseOpinionDraft.value.finalizable)}.`,
     `Felhasználható források: ${highlightedSources.value.length}, validált források: ${validatedSources.value.length}.`,
     `Nyitott kérdések: ${caseSummary.value.gaps.length || 0}, kizárandó források: ${excludedSources.value.length}.`,
@@ -984,7 +564,7 @@ const reportText = computed(() => {
     `- Riport dátuma: ${now}`,
     `- Határidő: ${currentCase.value.deadline || "nincs megadva"}`,
     `- Ügyállapot: ${currentCase.value.status}`,
-    `- Riport státusza: ${formatReportStatus(caseOpinionDraft.value.report_status)}`,
+    `- Riport státusza: ${reportStatusLabel.value}`,
     `- Végleges állásfoglalásra alkalmas: ${formatFinalizable(caseOpinionDraft.value.finalizable)}`,
     "",
     "## 2. Vezetői kivonat",
@@ -1000,21 +580,21 @@ const reportText = computed(() => {
     currentCase.value.description || "A felhasználó nem adott meg részletes ügyösszefoglalót.",
   );
   lines.push("");
-  lines.push("## 4. Utolsó keresési futam");
-  lines.push(lastSearchSummary.value || "Még nem történt keresési futam ebben a munkamenetben.");
-  lines.push("");
-  lines.push("## 5. Javasolt keresési és ellenőrzési sorrend");
-
-  if (searchPlan.value.length === 0) {
-    lines.push("- Nincs összeállított keresési terv.");
+  lines.push("## 4. Keresési futamok");
+  if (searchRuns.value.length === 0) {
+    lines.push("Még nem történt keresési futam ebben az ügyben.");
   } else {
-    searchPlan.value.forEach((plan) => {
-      lines.push(`### ${plan.title}`);
-      lines.push(`- Munkacél: ${plan.note}`);
-      lines.push(`- Lekérdezés: \`${plan.query}\``);
-      lines.push("");
+    searchRuns.value.slice(0, 10).forEach((run) => {
+      lines.push(`- ${run.created_at} | \`${run.base_query}\` | ${run.summary}`);
+      if (run.note?.trim()) lines.push(`  - Szakértői megjegyzés: ${run.note.trim()}`);
     });
   }
+  lines.push("");
+  lines.push("## 5. Keresési és ellenőrzési sorrend");
+  lines.push(
+    "- A kérés minden bekapcsolt platformon (Google, Google Hírek, Facebook, Magyar Közlöny, Nemzeti Jogszabálytár, KSH, bíróságok stb.) külön böngészőfülön futott, a platform szintaxisára igazított lekérdezéssel.",
+  );
+  lines.push("");
 
   lines.push("## 6. Ügyszintű döntéstámogatás");
   if (caseSummary.value.findings.length === 0) {
@@ -1053,7 +633,7 @@ const reportText = computed(() => {
 
   lines.push("");
   lines.push("## 7. Szakértői konklúzió");
-  lines.push(`- Riport státusz: ${formatReportStatus(caseOpinionDraft.value.report_status)}`);
+  lines.push(`- Riport státusz: ${reportStatusLabel.value}`);
   lines.push(`- Végleges állásfoglalásra alkalmas: ${formatFinalizable(caseOpinionDraft.value.finalizable)}`);
   lines.push("### 7.1. Előzetes álláspont");
   lines.push(
@@ -1306,13 +886,16 @@ async function loadCases() {
   }
   if (!currentCase.value && loadedCases.length > 0) {
     currentCase.value = loadedCases[0];
-    currentTab.value = "search";
+    currentTab.value = "browser";
   }
 }
 
 async function loadSources() {
   if (!currentCase.value) return;
-  sources.value = await api("get_sources", { caseId: currentCase.value.id });
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  const loaded = await api("get_sources", { caseId: op.caseId });
+  if (!op.same()) return; // késői válasz nem írhatja felül a másik ügy állapotát
+  sources.value = loaded;
   sourceReviewDrafts.value = Object.fromEntries(
     sources.value.map((source) => [
       source.id,
@@ -1333,13 +916,16 @@ async function loadSources() {
 
 async function loadAuditLogs() {
   if (!currentCase.value) return;
-  auditLogs.value = await api("get_audit_logs", { caseId: currentCase.value.id });
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  const loaded = await api("get_audit_logs", { caseId: op.caseId });
+  if (op.same()) auditLogs.value = loaded;
 }
 
 async function loadSearchRuns() {
   if (!currentCase.value) return;
-  searchRuns.value = await api("get_search_runs", { caseId: currentCase.value.id });
-  runNoteDrafts.value = Object.fromEntries(searchRuns.value.map((run) => [run.id, run.note || ""]));
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  const loaded = await api("get_search_runs", { caseId: op.caseId });
+  if (op.same()) searchRuns.value = loaded;
 }
 
 async function handleCreateCase() {
@@ -1359,7 +945,7 @@ async function handleCreateCase() {
     newCaseDeadline.value = "";
     await loadCases();
     currentCase.value = cases.value.find((item) => item.id === newId) ?? cases.value[0] ?? null;
-    currentTab.value = "search";
+    currentTab.value = "browser";
   } catch (error) {
     appError.value = `Ügy létrehozási hiba: ${String(error)}`;
   }
@@ -1376,87 +962,6 @@ async function handleDeleteCase(id) {
     await loadCases();
   } catch (error) {
     appError.value = `Törlési hiba: ${String(error)}`;
-  }
-}
-
-function applyPreset(preset) {
-  searchTerms.value.mustInclude = preset.must;
-  searchTerms.value.exactPhrase = preset.phrase;
-}
-
-function clearSearchForm() {
-  rawQuery.value = "";
-  searchTerms.value = {
-    mustInclude: "",
-    exactPhrase: "",
-    anyOf: "",
-    exclude: "",
-    site: "",
-    region: "",
-    yearFrom: "",
-    yearTo: "",
-  };
-  sourcePacks.value = {
-    official: true,
-    science: true,
-    market: true,
-    archive: true,
-    reddit: false,
-    facebook_groups: true,
-    shared: false,
-    community_general: false,
-    control: false,
-  };
-  researchLens.value = "balanced";
-  searchResults.value = [];
-  lastSearchSummary.value = "";
-  searchWarning.value = "";
-  searchDiagnostics.value = null;
-  searchRuns.value = currentCase.value ? searchRuns.value : [];
-  selectedRunIds.value = [];
-  activeSearchRunId.value = null;
-  archiveRunFilter.value = "all";
-  archiveStatusFilter.value = "all";
-  archiveDecisionFilter.value = "all";
-  archivePriorityFilter.value = "all";
-  archiveOriginFilter.value = "all";
-}
-
-function parseRunSummary(summary) {
-  const enginesMatch = summary.match(/Motorok:\s(.+?)\.\sTalálatok:/);
-  const resultMatch = summary.match(/Találatok:\s(\d+)/);
-  const planMatch = summary.match(/Keresési terv-lépések:\s(\d+)/);
-
-  return {
-    engines: enginesMatch ? enginesMatch[1].split(",").map((item) => item.trim()).filter(Boolean) : ["google"],
-    resultCount: resultMatch ? Number.parseInt(resultMatch[1], 10) : 0,
-    planCount: planMatch ? Number.parseInt(planMatch[1], 10) : 0,
-  };
-}
-
-function applySearchRun(run) {
-  rawQuery.value = run.base_query;
-  const parsed = parseRunSummary(run.summary);
-  selectedEngines.value = parsed.engines.length ? parsed.engines : ["google"];
-  selectedTierFilter.value = run.tier_filter;
-  lastSearchSummary.value = `Korábbi futam betöltve: ${run.summary}`;
-  activeSearchRunId.value = run.id;
-}
-
-async function rerunSearchRun(run) {
-  applySearchRun(run);
-  await runSearch();
-}
-
-async function saveRunNote(run) {
-  try {
-    await api("update_search_run_note", {
-      id: run.id,
-      note: runNoteDrafts.value[run.id] || "",
-    });
-    await Promise.all([loadSearchRuns(), loadAuditLogs()]);
-  } catch (error) {
-    appError.value = `Futam-megjegyzés mentési hiba: ${String(error)}`;
   }
 }
 
@@ -1519,324 +1024,140 @@ async function saveSourceReview(source) {
   }
 }
 
-function toggleRunComparison(runId) {
-  if (selectedRunIds.value.includes(runId)) {
-    selectedRunIds.value = selectedRunIds.value.filter((id) => id !== runId);
-    return;
-  }
-  if (selectedRunIds.value.length >= 2) {
-    selectedRunIds.value = [selectedRunIds.value[1], runId];
-    return;
-  }
-  selectedRunIds.value = [...selectedRunIds.value, runId];
-}
-
-function toggleEngine(engineId) {
-  if (selectedEngines.value.includes(engineId)) {
-    if (selectedEngines.value.length > 1) {
-      selectedEngines.value = selectedEngines.value.filter((item) => item !== engineId);
-    }
-    return;
-  }
-  selectedEngines.value = [...selectedEngines.value, engineId];
-}
-
-function buildQuerySet() {
-  const broad = broadQuery.value.trim();
-  const filtered = filteredQueries.value.map((item) => item.query);
-  const hasPackScope = !searchTerms.value.site.trim() && selectedSourcePackKeys.value.length > 0;
-
-  if (!broad) return [];
-
-  if (searchMode.value === "ai_only") {
-    return [broad];
-  }
-
-  if (nativeRunMode.value === "broad") {
-    return hasPackScope ? (filtered.length > 0 ? filtered : [broad]) : [broad];
-  }
-
-  if (nativeRunMode.value === "filtered") {
-    return filtered.length > 0 ? filtered : [broad];
-  }
-
-  return hasPackScope ? (filtered.length > 0 ? filtered : [broad]) : [broad, ...filtered];
-}
-
-async function runSearch() {
+async function openInBrowserPanel({ url, title }) {
   if (!currentCase.value) {
-    appError.value = "Keresés előtt hozz létre vagy válassz ki egy ügyet.";
+    appError.value = "A böngésző használatához válassz aktív ügyet.";
+    return;
+  }
+
+  try {
+    await openBrowserTab({ caseId: currentCase.value.id, url, title });
+    currentTab.value = "browser";
+  } catch (error) {
+    appError.value = `A böngészőfül megnyitása sikertelen: ${String(error)}`;
+  }
+}
+
+const notice = ref("");
+
+async function runBrowserSearch(query) {
+  if (!currentCase.value) {
+    appError.value = "A kereséshez válassz vagy hozz létre egy ügyet.";
     currentTab.value = "cases";
     return;
   }
-
-  const querySet = buildQuerySet();
-  if (querySet.length === 0) return;
-  const primaryQuery = querySet[0];
-
-  if (searchMode.value === "ai_only" && !aiConfigured.value) {
-    appError.value = "AI módhoz előbb ments el egy érvényes API kulcsot a keresési beállításoknál.";
-    return;
-  }
-
-  isSearching.value = true;
   appError.value = "";
-  searchWarning.value = "";
-  searchDiagnostics.value = null;
-  expandedResultKeys.value = {};
-
+  notice.value = "";
+  rawQuery.value = query;
+  // az ügy az indításkor rögzül; minden várakozás után ellenőrizzük, hogy nem váltottak-e ügyet
+  const op = beginOperation(() => currentCase.value?.id ?? null);
   try {
-    const calls = [];
-
-    if (searchMode.value !== "ai_only") {
-      selectedEngines.value.forEach((engine, engineIndex) => {
-        querySet.forEach((query) => {
-          calls.push(
-            api("execute_search", {
-              caseId: currentCase.value.id,
-              searchQuery: query,
-              tierFilter: selectedTierFilter.value,
-              engine,
-              searchMode: "native",
-              includeCse: engineIndex === 0,
-              selectedSourcePacks: selectedSourcePackKeys.value,
-            }),
-          );
-        });
+    const links = await api("browser_tab_links", { query, enabledPlatforms: enabledPlatforms.value });
+    op.assertSame();
+    if (links.length === 0) {
+      appError.value = "Nincs bekapcsolt platform. Kapcsolj be legalább egyet a Platformok menüben.";
+      return;
+    }
+    await closeSearchTabs();
+    op.assertSame();
+    const runId = await api("record_search_run", {
+      caseId: op.caseId,
+      summary: `Böngészős keresés: ${query}. Platformok: ${links.length}. Találatok: ${links.length}. Keresési terv-lépések: ${links.length}.`,
+      baseQuery: query,
+      engine: `böngésző | ${enabledPlatforms.value.length ? enabledPlatforms.value.join(", ") : "minden platform"}`,
+      tierFilter: 0,
+      planCount: links.length,
+      resultCount: links.length,
+      results: links.map((link) => ({
+        url: link.url,
+        title: link.label,
+        tier: 3,
+        source_type: "Böngészőfül",
+        query_used: query,
+        published_at: "",
+        evidence_level: "CONSTRUCTED",
+        story_id: 0,
+      })),
+    });
+    for (let index = 0; index < links.length; index += 1) {
+      op.assertSame();
+      await openBrowserTab({
+        caseId: op.caseId,
+        runId,
+        url: links[index].url,
+        title: links[index].label,
+        kind: "search",
+        lazy: index > 0,
+        activate: index === 0,
       });
     }
-
-    if (searchMode.value !== "native") {
-      calls.push(
-        api("execute_search", {
-          caseId: currentCase.value.id,
-          searchQuery: primaryQuery,
-          tierFilter: selectedTierFilter.value,
-          engine: selectedEngines.value[0] || "google",
-          searchMode: "ai_only",
-          includeCse: false,
-          selectedSourcePacks: selectedSourcePackKeys.value,
-        }),
-      );
-    }
-
-    const settledOutputs = await Promise.allSettled(calls);
-    const outputs = settledOutputs
-      .filter((item) => item.status === "fulfilled")
-      .map((item) => item.value);
-    const failedOutputs = settledOutputs
-      .filter((item) => item.status === "rejected")
-      .map((item) => String(item.reason));
-
-    if (outputs.length === 0) {
-      throw new Error(failedOutputs[0] || "A keresési futamok nem adtak vissza feldolgozható eredményt.");
-    }
-
-    const merged = outputs.flatMap((output) => output.results);
-    const aiErrors = outputs.map((output) => output.ai_error).filter(Boolean);
-    const cseErrors = outputs.map((output) => output.cse_error).filter(Boolean);
-    const braveErrors = outputs.map((output) => output.brave_error).filter(Boolean);
-    const tavilyErrors = outputs.map((output) => output.tavily_error).filter(Boolean);
-    const generatedCount = outputs.reduce((sum, output) => sum + (output.generated_count || 0), 0);
-    const filteredOutCount = outputs.reduce((sum, output) => sum + (output.filtered_out_count || 0), 0);
-
-    const unique = new Map();
-    merged.forEach((result) => {
-      const previous = unique.get(result.url);
-      if (!previous || previous.relevance < result.relevance) {
-        unique.set(result.url, result);
-      }
-    });
-
-    searchResults.value = Array.from(unique.values()).sort((left, right) => right.relevance - left.relevance);
-    searchDiagnostics.value = {
-      generated: generatedCount,
-      filteredOut: filteredOutCount,
-      kept: searchResults.value.length,
-    };
-
-    const warningParts = [];
-    if (aiErrors.length > 0) {
-      warningParts.push(`Az AI kiegészítés nem futott le, a natív találatok viszont megmaradtak. Hiba: ${aiErrors[0]}`);
-    }
-    if (cseErrors.length > 0) {
-      warningParts.push(`A Google CSE valódi találatlekérés nem futott le, a keresési terv kártyái megmaradtak. Hiba: ${cseErrors[0]}`);
-    }
-    if (braveErrors.length > 0) {
-      warningParts.push(`A Brave Search valódi találatlekérés nem futott le, a keresési terv kártyái megmaradtak. Hiba: ${braveErrors[0]}`);
-    }
-    if (tavilyErrors.length > 0) {
-      warningParts.push(`A Tavily valódi találatlekérés nem futott le, a keresési terv kártyái megmaradtak. Hiba: ${tavilyErrors[0]}`);
-    }
-    if (failedOutputs.length > 0) {
-      warningParts.push(`A keresési részfutamok közül ${failedOutputs.length} hibával leállt, de a sikeres találatok megmaradtak. Első hiba: ${failedOutputs[0]}`);
-    }
-    searchWarning.value = warningParts.join(" | ");
-
-    if (searchResults.value.length === 0) {
-      searchResults.value = buildFallbackSearchResults(primaryQuery);
-      appError.value =
-        filteredOutCount > 0
-          ? `A futam ${generatedCount} kártyát generált, de a Tier-szűrő mindet elrejtette. Közvetlen keresőnyitási védőháló jelent meg – érdemes a Tier-szűrőt lazítani.`
-          : "A generált keresési terv nem adott vissza találatkártyát, ezért közvetlen keresőnyitási védőháló jelent meg.";
-    }
-    lastSearchSummary.value =
-      `Mód: ${searchModes.find((item) => item.id === searchMode.value)?.label || searchMode.value}. ` +
-      `${searchMode.value === "native" ? `Natív futam: ${nativeRunModes.find((item) => item.id === nativeRunMode.value)?.label || nativeRunMode.value}. ` : ""}` +
-      `Elsődleges lekérdezés: ${primaryQuery}. Motorok: ${selectedEngines.value.join(", ")}. ` +
-      `Találatok: ${searchResults.value.length}. Keresési terv-lépések: ${searchPlan.value.length}.`;
-    activeSearchRunId.value = await api("record_search_run", {
-      caseId: currentCase.value.id,
-      summary: lastSearchSummary.value,
-      baseQuery: querySet.join(" || "),
-      engine: `${searchMode.value} | ${selectedEngines.value.join(", ")} | ${aiSettings.value.ai_provider}`,
-      tierFilter: selectedTierFilter.value,
-      planCount: searchPlan.value.length,
-      resultCount: searchResults.value.length,
-    });
     await Promise.all([loadAuditLogs(), loadSearchRuns()]);
   } catch (error) {
-    appError.value = `Keresési hiba: ${String(error)}`;
-  } finally {
-    isSearching.value = false;
+    if (error instanceof CaseChangedError) {
+      searchWarning.value = "A keresés megszakadt, mert közben ügyet váltottál. Indítsd újra az ügyben, ahová szánod.";
+      await closeTabsNotOf(currentCase.value?.id ?? null);
+      return;
+    }
+    appError.value = `A böngészős keresés nem indítható: ${String(error)}`;
   }
 }
 
-async function resetTierFilterAndRerun() {
-  selectedTierFilter.value = 0;
-  await runSearch();
-}
-
-async function openSearchResult(result) {
-  try {
-    await openUrl(result.url);
-  } catch (error) {
-    appError.value = `A hivatkozás megnyitása sikertelen: ${String(error)}`;
-  }
-}
-
-async function openResultInViewer(result) {
-  if (!currentCase.value) return;
-
-  try {
-    await api("open_viewer_window", {
-      caseId: currentCase.value.id,
-      url: result.url,
-      title: result.title,
-    });
-  } catch (error) {
-    appError.value = `A találatnéző megnyitása sikertelen: ${String(error)}`;
-  }
-}
-
-function isSearchEngineUrl(url) {
-  try {
-    const host = new URL(url).hostname.replace(/^www\./, "");
-    return (
-      host === "google.com" ||
-      host.endsWith(".google.com") ||
-      host === "bing.com" ||
-      host === "duckduckgo.com"
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function openQueryInGoogle(query) {
-  if (!query?.trim()) return;
-
-  try {
-    await openUrl(buildExternalSearchUrl("google", query.trim()));
-  } catch (error) {
-    appError.value = `A Google keresés megnyitása sikertelen: ${String(error)}`;
-  }
-}
-
-async function copyQueryToClipboard(query) {
-  if (!query?.trim()) return;
-
-  try {
-    await navigator.clipboard.writeText(query.trim());
-    appError.value = "";
-  } catch (error) {
-    appError.value = `A lekérdezés másolása sikertelen: ${String(error)}`;
-  }
-}
-
-async function archiveResult(result) {
-  return archiveResultVariant(result, "current");
-}
-
-async function archiveResultVariant(result, variant = "current") {
-  if (!currentCase.value) return;
-
-  if (!activeSearchRunId.value) {
-    appError.value = "Archiválás előtt futtass le vagy tölts be egy keresési futamot.";
+async function archiveBrowserTab(tab, selectionOnly = false) {
+  if (!tab || !currentCase.value) return;
+  notice.value = "";
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  if (tab.caseId !== op.caseId) {
+    appError.value = "Ez a fül másik ügyhöz tartozik, ezért nem archiválható az aktív ügyhöz.";
     return;
   }
-
-  const targetUrl =
-    variant === "original" && result.original_url?.trim() ? result.original_url.trim() : result.url;
-  const archiveLabel =
-    variant === "original" && result.original_url?.trim()
-      ? `${result.title} [élő forrás]`
-      : result.title;
-  const archiveKind =
-    variant === "original" && result.original_url?.trim() ? "live" : result.archive_kind;
-
-  busyArchiveId.value = `${result.url}|${variant}`;
   try {
-    let fetchedSection = "";
-    if (!isSearchEngineUrl(targetUrl)) {
-      try {
-        const page = await api("fetch_page_text", { url: targetUrl });
-        if (page.text?.trim()) {
-          fetchedSection = [
-            "",
-            "--- Letöltött oldaltartalom (automatikus kivonat) ---",
-            `Oldal címe: ${page.title || "nincs cím"}`,
-            `HTTP státusz: ${page.status}`,
-            `Végleges URL: ${page.final_url}`,
-            "",
-            page.text,
-          ].join("\n");
-        }
-      } catch {
-        fetchedSection = [
-          "",
-          "--- Letöltött oldaltartalom ---",
-          "Az oldal automatikus letöltése nem sikerült, az archívum a találatkártya kivonatát tartalmazza.",
-        ].join("\n");
-      }
+    const page = await captureTab(tab.id, selectionOnly);
+    op.assertSame();
+    if (page.empty_selection) {
+      appError.value = "Nincs kijelölt szöveg. Jelöld ki az oldalon az archiválandó részt, vagy vedd ki a pipát a teljes oldal mentéséhez.";
+      return;
     }
-
+    const url = page.url || tab.url;
+    const title = page.title || tab.title || url;
+    const kind = page.kind === "kijelolt_szoveg" ? "kijelolt_szoveg" : "teljes_oldal";
+    const content = [
+      `Cím: ${title}`,
+      `URL: ${url}`,
+      `Fül: ${tab.kind === "search" ? tab.title : "kézzel megnyitott oldal"}`,
+      `Lekérdezés: ${rawQuery.value || ""}`,
+      "Forrás: beépített böngésző (az oldal megjelenített szövege, ahogy a felhasználó látta)",
+      kind === "kijelolt_szoveg"
+        ? "Rögzítés módja: KIJELÖLT SZÖVEGRÉSZLET (nem a teljes oldal)"
+        : "Rögzítés módja: teljes oldal szövege",
+      page.truncated ? "FIGYELEM: a rögzített szöveg a 20 000 karakteres korlát miatt csonka." : "",
+      page.published ? `Közzétéve (oldal jelzése): ${page.published}` : "",
+      "",
+      kind === "kijelolt_szoveg" ? "--- Kijelölt szöveg ---" : "--- Megjelenített oldaltartalom ---",
+      page.text || "(az oldalról nem olvasható ki szöveg)",
+    ].join("\n");
     await api("archive_source", {
-      caseId: currentCase.value.id,
-      searchRunId: activeSearchRunId.value,
-      title: archiveLabel,
-      url: targetUrl,
-      tier: result.tier,
-      content: [
-        `Cím: ${archiveLabel}`,
-        `URL: ${targetUrl}`,
-        `Eredeti URL: ${result.original_url || targetUrl}`,
-        `Archivált URL: ${result.archived_url || ""}`,
-        `Snapshot: ${result.snapshot_timestamp || ""}`,
-        `Archiválási nézet: ${archiveKind}`,
-        `Tier: ${result.tier}`,
-        `Forrástípus: ${result.source_type}`,
-        `Lekérdezés: ${result.query_used}`,
-        "",
-        result.snippet,
-        fetchedSection,
-      ].join("\n"),
+      caseId: op.caseId,
+      searchRunId: tab.runId ?? null,
+      title,
+      url,
+      tier: 3,
+      publishedAt: page.published || null,
+      modifiedAt: page.modified || null,
+      timeSource: page.published || page.modified ? "meta" : null,
+      captureKind: kind,
+      captureTruncated: Boolean(page.truncated),
+      content,
     });
-    await Promise.all([loadSources(), loadAuditLogs()]);
+    if (op.same()) {
+      await Promise.all([loadSources(), loadAuditLogs()]);
+      notice.value = kind === "kijelolt_szoveg" ? `Kijelölt szöveg archiválva: ${title}` : `Archiválva: ${title}`;
+    }
   } catch (error) {
-    appError.value = `Archiválási hiba: ${String(error)}`;
-  } finally {
-    busyArchiveId.value = null;
+    if (error instanceof CaseChangedError) {
+      appError.value = "Az archiválás megszakadt, mert közben ügyet váltottál. Nem mentődött semmi.";
+      return;
+    }
+    appError.value = `Az oldal archiválása sikertelen: ${String(error)}`;
   }
 }
 
@@ -1862,25 +1183,88 @@ async function openArchivedFile(source) {
 async function saveReport() {
   if (!currentCase.value) return;
 
-  const qualityIssues = buildQualityChecks();
-  if (qualityIssues.length > 0) {
-    appError.value = `Riport export blokkolva: ${qualityIssues.join(" | ")}`;
-    return;
-  }
-
+  // a tervezet szabadon exportálható (a háttérrendszer „TERVEZET" jelöléssel menti); a végleges kiadás külön, jóváhagyással készül
   isSavingReport.value = true;
   reportSaved.value = false;
+  const op = beginOperation(() => currentCase.value?.id ?? null);
   try {
-    reportPath.value = await api("save_report", {
-      caseId: currentCase.value.id,
+    const path = await api("save_report", {
+      caseId: op.caseId,
       reportContent: reportText.value,
     });
+    if (!op.same()) return;
+    reportPath.value = path;
     reportSaved.value = true;
     await loadAuditLogs();
   } catch (error) {
     appError.value = `Riportmentési hiba: ${String(error)}`;
   } finally {
     isSavingReport.value = false;
+  }
+}
+
+const reportVersions = ref([]);
+const approverName = ref("");
+const approvingFinal = ref(false);
+
+async function loadReportVersions() {
+  if (!currentCase.value) {
+    reportVersions.value = [];
+    return;
+  }
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  try {
+    const loaded = await api("get_report_versions", { caseId: op.caseId });
+    if (op.same()) reportVersions.value = loaded;
+  } catch (error) {
+    appError.value = `A kiadott verziók nem tölthetők be: ${String(error)}`;
+  }
+}
+
+// A végleges kiadás csak mentett állapotból készülhet: a szerkesztett mezők egyezzenek a mentettel.
+const opinionUnsaved = computed(() => {
+  const saved = currentCase.value;
+  if (!saved) return false;
+  const draft = caseOpinionDraft.value;
+  return (
+    (draft.final_opinion || "") !== (saved.final_opinion || "") ||
+    (draft.report_status || "tervezet") !== (saved.report_status || "tervezet") ||
+    (draft.finalizable || "nem") !== (saved.finalizable || "nem") ||
+    (draft.open_questions || "") !== (saved.open_questions || "") ||
+    (draft.closed_points || "") !== (saved.closed_points || "") ||
+    (draft.preliminary_opinion || "") !== (saved.preliminary_opinion || "")
+  );
+});
+
+const finalReleaseBlockers = computed(() => {
+  const blockers = [...qualityChecks.value];
+  if (caseOpinionDraft.value.report_status !== "veglegesitett") {
+    blockers.push("Az ügy riport-státusza nem „véglegesített” (állítsd be és mentsd az álláspontot).");
+  }
+  if (opinionUnsaved.value) blockers.push("Mentetlen módosítás van az ügy álláspontjában: előbb mentsd.");
+  if (approverName.value.trim().length < 3) blockers.push("Add meg a jóváhagyó szakértő nevét.");
+  return blockers;
+});
+
+async function approveFinalReport() {
+  if (!currentCase.value || finalReleaseBlockers.value.length > 0) return;
+  if (!confirm("Jóváhagyod a végleges kiadást? A kiadott verzió változtathatatlan, és a mellékletek és értékelések pontos állapotát rögzíti.")) return;
+  approvingFinal.value = true;
+  const op = beginOperation(() => currentCase.value?.id ?? null);
+  try {
+    const info = await api("approve_final_report", {
+      caseId: op.caseId,
+      approverName: approverName.value.trim(),
+      reportContent: reportText.value,
+    });
+    if (op.same()) {
+      notice.value = `Végleges riport kiadva: v${info.version} (${info.approved_by}).`;
+      await Promise.all([loadReportVersions(), loadAuditLogs()]);
+    }
+  } catch (error) {
+    appError.value = `A végleges kiadás nem készülhet el: ${String(error)}`;
+  } finally {
+    approvingFinal.value = false;
   }
 }
 
@@ -1903,18 +1287,18 @@ function tierBadgeClass(tier) {
               <span class="h-1.5 w-1.5 rounded-full bg-sky-500"></span>
               Tauri-only kereséstámogató
             </div>
-            <h1 class="max-w-3xl text-3xl font-semibold tracking-tight text-slate-950 sm:text-4xl">
+            <h1 :class="advanced ? 'text-3xl sm:text-4xl' : 'text-2xl'" class="max-w-3xl font-semibold tracking-tight text-slate-950">
               Igazságügyi szakértői keresésekhez épített kutatási munkaasztal.
             </h1>
-            <p class="mt-3 max-w-2xl text-sm leading-6 text-slate-600">
+            <p v-if="advanced" class="mt-3 max-w-2xl text-sm leading-6 text-slate-600">
               A rendszer nem színlel élő találatlistát. Keresési futamokat, forráspiramist, archiválható nyomvonalat és exportálható összefoglalót ad.
             </p>
-            <div class="mt-3">
+            <div v-if="advanced" class="mt-3">
               <HelpTooltip text="A kérdőjelek fölé húzva az egeret rövid magyarázat jelenik meg az adott funkcióról vagy blokkról." />
             </div>
           </div>
 
-          <div class="grid gap-3 sm:grid-cols-3 lg:min-w-[420px]">
+          <div v-if="advanced" class="grid gap-3 sm:grid-cols-3 lg:min-w-[420px]">
             <div class="rounded-2xl border border-white/70 bg-white/75 px-4 py-3 shadow-sm">
               <div class="flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] text-slate-500">Aktív ügyek <HelpTooltip text="Ennyi ügy van jelenleg a rendszerben. Az ügyek külön keresési és riport munkafolyamot kapnak." /></div>
               <div class="mt-2 text-2xl font-semibold text-slate-900">{{ cases.length }}</div>
@@ -1933,6 +1317,10 @@ function tierBadgeClass(tier) {
 
       <div v-if="appError" class="mb-4 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
         {{ appError }}
+      </div>
+
+      <div v-if="notice" class="mb-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+        {{ notice }}
       </div>
 
       <div v-if="searchWarning" class="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
@@ -1954,7 +1342,19 @@ function tierBadgeClass(tier) {
           {{ tab.label }}
         </button>
 
-        <div class="ml-auto flex min-w-[260px] items-center gap-2 rounded-full border border-white/70 bg-white/80 px-4 py-2">
+        <div class="ml-auto flex items-center rounded-full border border-white/70 bg-white/80 p-1" title="Egyszerű: csak a napi munka. Haladó: minden beállítás és az audit nézet.">
+          <button
+            v-for="mode in [{ id: 'simple', label: 'Egyszerű' }, { id: 'advanced', label: 'Haladó' }]"
+            :key="mode.id"
+            @click="setUiMode(mode.id)"
+            :class="[
+              'rounded-full px-3 py-1.5 text-xs font-semibold transition',
+              uiMode === mode.id ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100',
+            ]"
+          >{{ mode.label }}</button>
+        </div>
+
+        <div class="flex min-w-[260px] items-center gap-2 rounded-full border border-white/70 bg-white/80 px-4 py-2">
           <span class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Aktív ügy</span>
           <select
             v-model="currentCase"
@@ -2063,7 +1463,7 @@ function tierBadgeClass(tier) {
 
                   <div class="flex shrink-0 gap-2">
                     <button
-                      @click="currentCase = item; currentTab = 'search'"
+                      @click="currentCase = item; currentTab = 'browser'"
                       class="rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-700"
                     >
                       Megnyitás
@@ -2111,700 +1511,26 @@ function tierBadgeClass(tier) {
           </aside>
         </section>
 
-        <section v-else-if="currentTab === 'search'" class="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
-          <div class="glass rounded-[28px] p-6">
-            <div class="flex items-start justify-between gap-4">
-              <div>
-                <div class="flex items-center gap-3">
-                  <h2 class="text-2xl font-semibold text-slate-950">Keresési futam</h2>
-                  <HelpTooltip text="Ebben a nézetben állítod össze a keresési feltételeket és indítod el a kutatási futamot. A rendszer priorizált megnyitási tervet ad a releváns forrásokhoz." />
-                </div>
-                <p class="mt-1 text-sm text-slate-600">
-                  Többlépcsős lekérdezésépítés, majd célzott nyitási lista a releváns forrástípusokra.
-                </p>
-              </div>
-              <button
-                @click="clearSearchForm"
-                class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:border-slate-300"
-              >
-                Űrlap törlése
-              </button>
-            </div>
+        <section v-else-if="currentTab === 'browser'">
+          <BrowserPanel
+            :case-id="currentCase?.id ?? null"
+            :platforms="platformList"
+            :enabled-ids="enabledPlatforms"
+            :initial-query="rawQuery"
+            @search="runBrowserSearch"
+            @toggle-platform="togglePlatform"
+            @open-url="openInBrowserPanel"
+            @archive="archiveBrowserTab"
+            @error="(message) => (appError = message)"
+          />
+        </section>
 
-            <div class="mt-6 flex flex-wrap gap-2">
-              <button
-                v-for="preset in presets"
-                :key="preset.id"
-                @click="applyPreset(preset)"
-                class="rounded-full border border-sky-200 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100"
-              >
-                {{ preset.label }}
-              </button>
-            </div>
-
-            <div class="mt-6 grid gap-4 md:grid-cols-2">
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Kötelező kifejezések</span>
-                <input v-model="searchTerms.mustInclude" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Pontos kifejezés</span>
-                <input v-model="searchTerms.exactPhrase" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Alternatív fogalmak</span>
-                <input v-model="searchTerms.anyOf" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Kizárás</span>
-                <input v-model="searchTerms.exclude" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Cél domain</span>
-                <input v-model="searchTerms.site" placeholder="pl. ksh.hu" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Földrajzi fókusz</span>
-                <input v-model="searchTerms.region" placeholder="pl. Budapest vagy Hajdú-Bihar" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-              </label>
-              <div class="grid grid-cols-2 gap-3">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Évtől</span>
-                  <input v-model="searchTerms.yearFrom" inputmode="numeric" placeholder="2020" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-                </label>
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Évig</span>
-                  <input v-model="searchTerms.yearTo" inputmode="numeric" placeholder="2026" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-                </label>
-              </div>
-            </div>
-
-            <label class="mt-4 grid gap-1.5 text-sm">
-              <span class="font-semibold text-slate-700">Nyers lekérdezés felülbírálás</span>
-              <textarea v-model="rawQuery" rows="4" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 font-mono text-sm outline-none transition focus:border-slate-400"></textarea>
-            </label>
-
-            <div class="mt-5 grid gap-4 lg:grid-cols-[1fr_auto]">
-              <div>
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Forráscsomagok</div>
-                <p class="mt-2 text-xs leading-5 text-slate-500">
-                  Csak az itt bepipált forráscsomagok oldalain fut a natív és a valódi webes keresés. Aktív hatókör: {{ selectedSourcePackSummary }}
-                </p>
-                <div class="mt-3 flex flex-wrap gap-2">
-                  <label
-                    v-for="(enabled, key) in sourcePacks"
-                    :key="key"
-                    class="inline-flex max-w-full items-start gap-2 rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700"
-                  >
-                    <input v-model="sourcePacks[key]" type="checkbox" class="mt-0.5 accent-slate-900" />
-                    <span class="grid gap-1">
-                      <span>{{ sourcePackMeta[key]?.label || key }}</span>
-                      <span class="text-[11px] font-normal leading-4 text-slate-500">
-                        {{ sourcePackMeta[key]?.info }}
-                      </span>
-                    </span>
-                  </label>
-                </div>
-              </div>
-
-              <label class="grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Kutatási lencse</span>
-                <select v-model="researchLens" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none">
-                  <option value="balanced">Kiegyensúlyozott</option>
-                  <option value="pricing">Ár / óradíj fókusz</option>
-                  <option value="legal">Jogi / módszertani fókusz</option>
-                  <option value="operations">Költség / üzemeltetés fókusz</option>
-                </select>
-              </label>
-
-              <div class="grid gap-3">
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Keresési mód</div>
-                <div class="grid gap-3">
-                  <label
-                    v-for="mode in searchModes"
-                    :key="mode.id"
-                    :class="[
-                      'grid gap-1 rounded-2xl border px-4 py-3 transition',
-                      searchMode === mode.id ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700',
-                    ]"
-                  >
-                    <div class="flex items-center gap-3">
-                      <input v-model="searchMode" type="radio" :value="mode.id" class="accent-slate-900" />
-                      <span class="text-sm font-semibold">{{ mode.label }}</span>
-                    </div>
-                    <span :class="searchMode === mode.id ? 'text-slate-300' : 'text-slate-500'" class="text-xs leading-5">
-                      {{ mode.note }}
-                    </span>
-                  </label>
-                </div>
-              </div>
-            </div>
-
-            <div v-if="searchMode === 'native'" class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Natív futtatási profil</div>
-              <div class="mt-3 grid gap-3 lg:grid-cols-3">
-                <label
-                  v-for="mode in nativeRunModes"
-                  :key="mode.id"
-                  :class="[
-                    'grid gap-1 rounded-2xl border px-4 py-3 transition',
-                    nativeRunMode === mode.id ? 'border-slate-900 bg-slate-900 text-white' : 'border-slate-200 bg-white text-slate-700',
-                  ]"
-                >
-                  <div class="flex items-center gap-3">
-                    <input v-model="nativeRunMode" type="radio" :value="mode.id" class="accent-slate-900" />
-                    <span class="text-sm font-semibold">{{ mode.label }}</span>
-                  </div>
-                  <span :class="nativeRunMode === mode.id ? 'text-slate-300' : 'text-slate-500'" class="text-xs leading-5">
-                    {{ mode.note }}
-                  </span>
-                </label>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">AI kapcsolat</div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Hybrid vagy AI-only módnál helyben mentett API kulcsból dolgozik. A kulcs a portable adatbázisban marad ezen a gépen.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  AI beállítások mentése
-                </button>
-              </div>
-
-              <div class="mt-4 grid gap-4 lg:grid-cols-2">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Szolgáltató</span>
-                  <select v-model="aiSettings.ai_provider" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none">
-                    <option v-for="provider in aiProviders" :key="provider.id" :value="provider.id">
-                      {{ provider.label }}
-                    </option>
-                  </select>
-                </label>
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Modell</span>
-                  <input v-model="aiSettings.ai_model" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400" />
-                </label>
-              </div>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">API kulcs</span>
-                <input
-                  v-model="aiSettings.api_key"
-                  type="password"
-                  :placeholder="aiSettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'sk-... vagy a szolgáltató kulcsa'"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                />
-                <span v-if="aiSettings.api_key_set" class="text-xs text-slate-500">
-                  A mentett kulcs biztonsági okból nem jelenik meg. Üresen hagyva a korábbi kulcs marad érvényben.
-                </span>
-              </label>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">AI rendszerutasítás</span>
-                <textarea
-                  v-model="aiSettings.system_prompt"
-                  rows="4"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                ></textarea>
-              </label>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="aiConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-amber-200 bg-amber-50 text-amber-800'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ aiConfigured ? "API kulcs megadva" : "API kulcs nincs megadva" }}
-                </span>
-                <span v-if="settingsSaved" class="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 font-semibold uppercase tracking-[0.18em] text-sky-700">
-                  Mentve
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Google CSE – valódi találatok
-                    <HelpTooltip text="A Google Programmable Search Engine valódi Google találatokat (cím, URL, kivonat) ad vissza a keresési terv mellé. Natív és hibrid módban fut, tisztán AI módban nem. Az ingyenes keret napi 100 lekérdezés." />
-                  </div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Ha be van állítva, a natív és hibrid futamok valódi Google találatokkal egészülnek ki. Beállítás: hozz létre keresőt a programmablesearchengine.google.com oldalon (ez adja a cx azonosítót), és kérj Custom Search API kulcsot a Google Cloud Console-ban.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  CSE beállítások mentése
-                </button>
-              </div>
-
-              <div class="mt-4 grid gap-4 lg:grid-cols-2">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Search Engine ID (cx)</span>
-                  <input
-                    v-model="cseSettings.cx"
-                    placeholder="pl. a1b2c3d4e5f6g7h8i"
-                    class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                  />
-                </label>
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Custom Search API kulcs</span>
-                  <input
-                    v-model="cseSettings.api_key"
-                    type="password"
-                    :placeholder="cseSettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'AIza... kezdetű Google API kulcs'"
-                    class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                  />
-                </label>
-              </div>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="cseConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-600'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ cseConfigured ? "CSE aktív – valódi találatok" : "CSE nincs beállítva – csak keresési terv" }}
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Tavily – teljes webes találatok (ingyenes)
-                    <HelpTooltip text="A Tavily keresési API teljes webes valódi találatokat ad. Az ingyenes csomag havi 1000 lekérdezés, bankkártya nélkül, csak e-mailes regisztrációval. Natív és hibrid módban fut, tisztán AI módban nem." />
-                  </div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Teljes webes valódi találatok bankkártya nélkül: regisztrálj a tavily.com oldalon, és másold ide az API kulcsot (tvly-... kezdetű). Az ingyenes keret havi 1000 lekérdezés. A CSE-vel együtt is futhat, a találatok közösen rangsorolódnak.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  Tavily beállítások mentése
-                </button>
-              </div>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Tavily API kulcs</span>
-                <input
-                  v-model="tavilySettings.api_key"
-                  type="password"
-                  :placeholder="tavilySettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'tvly-... kezdetű Tavily API kulcs'"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                />
-              </label>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="tavilyConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-600'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ tavilyConfigured ? "Tavily aktív – teljes webes találatok" : "Tavily nincs beállítva" }}
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <div>
-                  <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Brave Search – teljes webes találatok
-                    <HelpTooltip text="A Brave Search API saját, teljes webes indexből ad valódi találatokat. Fizetős előfizetés kell hozzá, ezért csak akkor érdemes beállítani, ha van Brave API előfizetésed. Natív és hibrid módban fut, tisztán AI módban nem." />
-                  </div>
-                  <p class="mt-2 text-sm text-slate-600">
-                    Teljes webes valódi találatok a Brave saját indexéből. Fizetős API (brave.com/search/api), ezért csak akkor töltsd ki, ha van előfizetésed – ingyenes alternatívaként a fenti Tavily ugyanezt tudja. A többi lekérdezővel együtt is futhat.
-                  </p>
-                </div>
-                <button
-                  @click="saveAppSettings"
-                  class="shrink-0 rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  Brave beállítások mentése
-                </button>
-              </div>
-
-              <label class="mt-4 grid gap-1.5 text-sm">
-                <span class="font-semibold text-slate-700">Brave Search API kulcs</span>
-                <input
-                  v-model="braveSettings.api_key"
-                  type="password"
-                  :placeholder="braveSettings.api_key_set ? 'Kulcs elmentve – új kulcs megadásával felülírható' : 'BSA... kezdetű Brave API kulcs'"
-                  class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none transition focus:border-slate-400"
-                />
-              </label>
-
-              <div class="mt-4 flex flex-wrap items-center gap-3 text-xs">
-                <span
-                  :class="braveConfigured ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-600'"
-                  class="rounded-full border px-3 py-1.5 font-semibold uppercase tracking-[0.18em]"
-                >
-                  {{ braveConfigured ? "Brave aktív – teljes webes találatok" : "Brave nincs beállítva" }}
-                </span>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-slate-950 px-4 py-4 text-sm text-slate-100">
-              <div class="flex items-center justify-between gap-3">
-                <div class="text-[11px] uppercase tracking-[0.18em] text-slate-400">Széles alaplekérdezés</div>
-                <div class="flex flex-wrap gap-2">
-                  <button
-                    @click="copyQueryToClipboard(broadQuery)"
-                    :disabled="!broadQuery"
-                    class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500 disabled:opacity-50"
-                  >
-                    Lekérdezés másolása
-                  </button>
-                  <button
-                    @click="openQueryInGoogle(broadQuery)"
-                    :disabled="!broadQuery"
-                    class="rounded-full border border-slate-700 bg-slate-900 px-3 py-2 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500 disabled:opacity-50"
-                  >
-                    Google-ben megnyitás
-                  </button>
-                </div>
-              </div>
-              <div class="mt-2 break-words font-mono text-[13px] leading-6">{{ broadQuery || "A lekérdezés itt jelenik meg." }}</div>
-              <div v-if="filteredQueries.length > 0" class="mt-4 border-t border-slate-800 pt-4">
-                <div class="text-[11px] uppercase tracking-[0.18em] text-slate-400">Szűrt szakértői lekérdezések ({{ filteredQueries.length }})</div>
-                <div v-for="item in filteredQueries" :key="item.label" class="mt-3">
-                  <div class="flex items-center justify-between gap-3">
-                    <div class="text-[11px] font-semibold text-slate-400">{{ item.label }}</div>
-                    <div class="flex flex-wrap gap-2">
-                      <button
-                        @click="copyQueryToClipboard(item.query)"
-                        class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500"
-                      >
-                        Másolás
-                      </button>
-                      <button
-                        @click="openQueryInGoogle(item.query)"
-                        class="rounded-full border border-slate-700 bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-slate-200 transition hover:border-slate-500"
-                      >
-                        Google-ben
-                      </button>
-                    </div>
-                  </div>
-                  <div class="mt-1 break-words font-mono text-[12px] leading-6 text-slate-300">{{ item.query }}</div>
-                </div>
-              </div>
-              <div v-if="queryWordWarnings.length > 0" class="mt-4 rounded-2xl border border-amber-700/60 bg-amber-950/40 px-3 py-2 text-xs leading-5 text-amber-200">
-                <div class="font-semibold">Figyelem: a Google körülbelül 32 szóig veszi figyelembe a lekérdezést, a többletet levágja.</div>
-                <div v-for="warning in queryWordWarnings" :key="warning" class="mt-1">{{ warning }}</div>
-              </div>
-            </div>
-
-            <div class="mt-5 rounded-3xl border border-slate-200 bg-white/85 p-4">
-              <div class="flex items-center justify-between gap-3">
-              <div>
-                <div class="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Javasolt keresési sorrend <HelpTooltip text="A rendszer itt lépésekre bontja a keresési stratégiát. Ez segít abban, hogy a kutatás ne egyetlen keresőkifejezésből álljon." /></div>
-                <div class="mt-1 text-xs text-slate-500">{{ searchPlan.length }} lépés</div>
-              </div>
-                <button
-                  @click="searchPlanExpanded = !searchPlanExpanded"
-                  class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                >
-                  {{ searchPlanExpanded ? "Elrejtés" : "Megnyitás" }}
-                </button>
-              </div>
-              <div v-if="searchPlanExpanded" class="mt-3 grid gap-3">
-                <article v-for="plan in searchPlan" :key="plan.title" class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                  <div class="text-sm font-semibold text-slate-900">{{ plan.title }}</div>
-                  <p class="mt-1 text-xs leading-5 text-slate-600">{{ plan.note }}</p>
-                  <p class="mt-2 break-words font-mono text-[11px] leading-5 text-slate-500">{{ plan.query }}</p>
-                </article>
-              </div>
-              <div v-else class="mt-3 text-xs text-slate-500">
-                A részletes keresési sorrend össze van csukva. Nyisd meg, ha a teljes tervet látni akarod.
-              </div>
-            </div>
-
-            <div class="mt-5 grid gap-4 lg:grid-cols-[1fr_auto] lg:items-end">
-              <div>
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Keresőmotorok</div>
-                <div class="mt-3 grid gap-3">
-                  <button
-                    v-for="engine in engines"
-                    :key="engine.id"
-                    @click="toggleEngine(engine.id)"
-                    :class="[
-                      'rounded-2xl border px-4 py-3 text-left transition',
-                      selectedEngines.includes(engine.id)
-                        ? 'border-slate-900 bg-slate-900 text-white'
-                        : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300',
-                    ]"
-                  >
-                    <div class="text-sm font-semibold">{{ engine.label }}</div>
-                    <div :class="selectedEngines.includes(engine.id) ? 'text-slate-300' : 'text-slate-500'" class="mt-1 text-xs">
-                      {{ engine.note }}
-                    </div>
-                  </button>
-                </div>
-              </div>
-
-              <div class="grid gap-3">
-                <label class="grid gap-1.5 text-sm">
-                  <span class="font-semibold text-slate-700">Tier szűrő</span>
-                  <select v-model="selectedTierFilter" class="rounded-2xl border border-slate-200 bg-white px-4 py-3 outline-none">
-                    <option v-for="option in tierOptions" :key="option.value" :value="option.value">
-                      {{ option.label }}
-                    </option>
-                  </select>
-                </label>
-                <button
-                  @click="runSearch"
-                  :disabled="isSearching || !constructedQuery"
-                  class="rounded-2xl bg-sky-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-sky-600/20 transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {{ isSearching ? "Futam készül..." : "Keresési futam generálása" }}
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div class="glass rounded-[28px] p-6">
-            <div class="flex items-start justify-between gap-4">
-              <div>
-                <div class="flex items-center gap-3">
-                  <h2 class="text-2xl font-semibold text-slate-950">Ajánlott nyitások</h2>
-                  <HelpTooltip text="Itt jelenik meg a keresésből képzett megnyitási terv. A találatok innen nyithatók meg vagy archiválhatók további értékeléshez." />
-                </div>
-                <p class="mt-1 text-sm text-slate-600">
-                  Itt nem kész találatlista van, hanem priorizált megnyitási terv. Minden kártya megnyitható vagy archiválható.
-                </p>
-              </div>
-              <div class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600">
-                {{ searchResults.length }} elem
-              </div>
-            </div>
-
-            <div v-if="lastSearchSummary" class="mt-4 rounded-2xl border border-slate-200 bg-white/80 px-4 py-3 text-xs text-slate-600">
-              {{ lastSearchSummary }}
-            </div>
-
-            <div v-if="searchDiagnostics" class="mt-3 flex flex-wrap items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50/90 px-4 py-3 text-xs text-slate-600">
-              <span>
-                Generált kártyák: <span class="font-semibold text-slate-900">{{ searchDiagnostics.generated }}</span>,
-                megjelenítve: <span class="font-semibold text-slate-900">{{ searchDiagnostics.kept }}</span><template v-if="searchDiagnostics.filteredOut > 0">,
-                Tier-szűrő által elrejtve: <span class="font-semibold text-amber-700">{{ searchDiagnostics.filteredOut }}</span></template>.
-              </span>
-              <button
-                v-if="searchDiagnostics.filteredOut > 0 && selectedTierFilter !== 0"
-                @click="resetTierFilterAndRerun"
-                :disabled="isSearching"
-                class="rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-800 transition hover:bg-amber-100 disabled:opacity-60"
-              >
-                Tier-szűrő nullázása és újrafuttatás
-              </button>
-            </div>
-
-            <div v-if="searchRuns.length > 0" class="mt-4 rounded-3xl border border-slate-200 bg-slate-50/90 p-4">
-              <div class="flex items-center justify-between gap-4">
-                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Korábbi futamok ugyanebben az ügyben</div>
-                <div class="text-[11px] text-slate-500">2 futam kijelölése esetén gyors összevetés jelenik meg</div>
-              </div>
-
-              <div v-if="selectedRunComparison.length === 2" class="mt-3 rounded-2xl border border-slate-200 bg-white px-4 py-3">
-                <div class="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Futam összevetés</div>
-                <div class="mt-3 grid gap-3 lg:grid-cols-2">
-                  <article
-                    v-for="run in selectedRunComparison"
-                    :key="run.id"
-                    class="rounded-2xl border border-slate-200 bg-slate-50 px-3 py-3"
-                  >
-                    <div class="text-sm font-semibold text-slate-900">{{ run.created_at }}</div>
-                    <div class="mt-1 text-xs text-slate-600">{{ run.summary }}</div>
-                    <button
-                      @click="toggleRunExpanded(run.id)"
-                      class="mt-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-700 transition hover:border-slate-300"
-                    >
-                      {{ isRunExpanded(run.id) ? "Részletek elrejtése" : "Részletek" }}
-                    </button>
-                    <div v-if="isRunExpanded(run.id)" class="mt-2 rounded-2xl border border-slate-200 bg-white px-3 py-3">
-                      <div class="break-words font-mono text-[11px] leading-5 text-slate-500">{{ run.base_query }}</div>
-                    </div>
-                    <div v-if="run.note?.trim()" class="mt-2 text-xs leading-5 text-slate-600">
-                      Megjegyzés: {{ run.note }}
-                    </div>
-                  </article>
-                </div>
-              </div>
-
-              <div class="mt-3 grid gap-2">
-                <article
-                  v-for="run in searchRuns.slice(0, 5)"
-                  :key="run.id"
-                  class="rounded-2xl border border-slate-200 bg-white px-3 py-3"
-                >
-                  <div class="flex flex-col gap-3">
-                    <div class="flex flex-col gap-1 lg:flex-row lg:items-start lg:justify-between">
-                      <div class="min-w-0">
-                        <div class="text-sm font-semibold text-slate-900">{{ run.summary }}</div>
-                        <div class="mt-1 text-xs text-slate-500">{{ run.result_count }} találat | {{ run.engine }}</div>
-                      </div>
-                      <div class="shrink-0 text-xs text-slate-500">{{ run.created_at }}</div>
-                    </div>
-
-                    <div class="flex flex-wrap gap-2">
-                      <button
-                        @click="applySearchRun(run)"
-                        class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      >
-                        Betöltés
-                      </button>
-                      <button
-                        @click="rerunSearchRun(run)"
-                        class="rounded-full bg-slate-900 px-3 py-2 text-xs font-semibold text-white transition hover:bg-slate-700"
-                      >
-                        Újrafuttatás
-                      </button>
-                      <button
-                        @click="toggleRunComparison(run.id)"
-                        :class="[
-                          'rounded-full border px-3 py-2 text-xs font-semibold transition',
-                          selectedRunIds.includes(run.id)
-                            ? 'border-sky-700 bg-sky-700 text-white'
-                            : 'border-sky-200 bg-sky-50 text-sky-700 hover:bg-sky-100',
-                        ]"
-                      >
-                        {{ selectedRunIds.includes(run.id) ? "Kijelölve" : "Összevetéshez" }}
-                      </button>
-                      <button
-                        @click="toggleRunExpanded(run.id)"
-                        class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      >
-                        {{ isRunExpanded(run.id) ? "Részletek elrejtése" : "Részletek" }}
-                      </button>
-                    </div>
-
-                    <div v-if="isRunExpanded(run.id)" class="grid gap-3 rounded-2xl border border-slate-200 bg-slate-50 p-3">
-                      <div>
-                        <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Teljes lekérdezés</div>
-                        <div class="mt-2 break-words font-mono text-[11px] leading-5 text-slate-500">{{ run.base_query }}</div>
-                      </div>
-                      <div class="grid gap-2 rounded-2xl border border-slate-200 bg-white p-3">
-                        <label class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
-                          Szakértői megjegyzés
-                        </label>
-                        <textarea
-                          v-model="runNoteDrafts[run.id]"
-                          rows="3"
-                          class="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-xs leading-5 text-slate-700 outline-none"
-                          placeholder="Rövid megjegyzés a futam eredményéről, hiányairól vagy következő lépéséről."
-                        ></textarea>
-                        <div class="flex items-center justify-between gap-3">
-                          <div class="text-[11px] text-slate-500">
-                            {{ run.note?.trim() ? "Van mentett megjegyzés." : "Még nincs mentett megjegyzés." }}
-                          </div>
-                          <button
-                            @click="saveRunNote(run)"
-                            class="rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                          >
-                            Megjegyzés mentése
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </article>
-              </div>
-            </div>
-
-            <div class="mt-5 grid gap-4">
-              <article
-                v-for="result in searchResults"
-                :key="getSearchResultKey(result)"
-                class="rounded-3xl border border-slate-200 bg-white/90 p-5 shadow-sm"
-              >
-                <div class="flex flex-col gap-4">
-                  <div class="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                    <div class="min-w-0">
-                      <div class="flex flex-wrap items-center gap-2">
-                        <span :class="tierBadgeClass(result.tier)" class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]">
-                          Tier {{ result.tier }}
-                        </span>
-                        <span class="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-600">
-                          {{ result.source_type }}
-                        </span>
-                        <span
-                          :class="isWaybackResult(result) ? 'border-sky-200 bg-sky-50 text-sky-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'"
-                          class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em]"
-                        >
-                          {{ formatArchiveKind(result.archive_kind) }}
-                        </span>
-                        <span class="text-xs font-semibold text-slate-500">Relevancia: {{ result.relevance }}</span>
-                      </div>
-                      <h3 class="mt-3 text-lg font-semibold text-slate-900">{{ result.title }}</h3>
-                      <p class="mt-2 text-sm leading-6 text-slate-600">{{ result.snippet }}</p>
-                    </div>
-
-                    <div class="flex shrink-0 flex-wrap gap-2">
-                      <button
-                        @click="openSearchResult(result)"
-                        class="rounded-full bg-slate-900 px-4 py-2 text-xs font-semibold text-white transition hover:bg-slate-700"
-                      >
-                        {{ result.action_label }}
-                      </button>
-                      <button
-                        @click="openResultInViewer(result)"
-                        class="rounded-full border border-slate-300 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-400"
-                      >
-                        Appon belül
-                      </button>
-                      <button
-                        @click="archiveResult(result)"
-                        :disabled="busyArchiveId === `${result.url}|current`"
-                        class="rounded-full border border-sky-200 bg-sky-50 px-4 py-2 text-xs font-semibold text-sky-700 transition hover:bg-sky-100 disabled:opacity-60"
-                      >
-                        {{ busyArchiveId === `${result.url}|current` ? "Archiválás..." : "Aktuális nézet archiválása" }}
-                      </button>
-                      <button
-                        v-if="isWaybackResult(result) && result.original_url"
-                        @click="archiveResultVariant(result, 'original')"
-                        :disabled="busyArchiveId === `${result.url}|original`"
-                        class="rounded-full border border-emerald-200 bg-emerald-50 px-4 py-2 text-xs font-semibold text-emerald-700 transition hover:bg-emerald-100 disabled:opacity-60"
-                      >
-                        {{ busyArchiveId === `${result.url}|original` ? "Archiválás..." : "Élő URL archiválása" }}
-                      </button>
-                      <button
-                        @click="toggleResultExpanded(result)"
-                        class="rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300"
-                      >
-                        {{ isResultExpanded(result) ? "Részletek elrejtése" : "Részletek" }}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div class="break-all text-xs text-sky-700">{{ result.url }}</div>
-                  <div v-if="isResultExpanded(result)" class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
-                    <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Keresési részletek</div>
-                    <p class="mt-3 break-words font-mono text-[12px] leading-6 text-slate-600">{{ result.query_used }}</p>
-                    <p v-if="result.original_url && result.original_url !== result.url" class="mt-3 break-all text-xs text-slate-500">
-                      Eredeti URL: {{ result.original_url }}
-                    </p>
-                    <p v-if="result.snapshot_timestamp" class="mt-1 text-xs text-slate-500">
-                      Snapshot: {{ result.snapshot_timestamp }}
-                    </p>
-                  </div>
-                </div>
-              </article>
-
-              <div v-if="searchResults.length === 0" class="rounded-3xl border border-dashed border-slate-300 bg-white/70 p-10 text-center text-sm text-slate-500">
-                Még nincs keresési futam. Állítsd össze a lekérdezést és indítsd el.
-              </div>
-            </div>
-          </div>
+        <section v-else-if="currentTab === 'history'" class="glass rounded-[28px] p-6">
+          <HistoryPanel
+            :case-id="currentCase?.id ?? null"
+            :search-runs="searchRuns"
+            @error="(message) => (appError = message)"
+          />
         </section>
 
         <section v-else-if="currentTab === 'archive'" class="glass rounded-[28px] p-6">
@@ -3299,8 +2025,46 @@ function tierBadgeClass(tier) {
               :disabled="isSavingReport || !currentCase"
               class="mt-6 w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:opacity-60"
             >
-              {{ isSavingReport ? "Mentés..." : "Markdown riport mentése" }}
+              {{ isSavingReport ? "Mentés..." : "Tervezet mentése (nem végleges)" }}
             </button>
+            <p class="mt-2 text-xs leading-5 text-slate-500">
+              A tervezet bármikor exportálható, a fájl „TERVEZET – nem végleges kiadás" jelölést kap.
+            </p>
+
+            <div class="mt-6 rounded-3xl border-2 border-slate-900/10 bg-white/90 p-4">
+              <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Végleges kiadás</div>
+              <p class="mt-2 text-xs leading-5 text-slate-600">
+                Csak mentett, „véglegesített" ügyállapotból készül, a szakértő saját jóváhagyásával. A kiadott verzió változtathatatlan, és rögzíti a felhasznált mellékletek és értékelések pontos állapotát.
+              </p>
+              <label class="mt-3 grid gap-1 text-xs font-semibold text-slate-700">
+                Jóváhagyó szakértő neve
+                <input v-model="approverName" placeholder="pl. Dr. Minta Szakértő" class="rounded-2xl border border-slate-200 bg-white px-3 py-2 text-sm font-normal outline-none" />
+              </label>
+              <ul v-if="finalReleaseBlockers.length" class="mt-3 grid gap-1 text-xs leading-5 text-amber-800">
+                <li v-for="item in finalReleaseBlockers" :key="item">• {{ item }}</li>
+              </ul>
+              <button
+                @click="approveFinalReport"
+                :disabled="approvingFinal || !currentCase || finalReleaseBlockers.length > 0"
+                class="mt-3 w-full rounded-2xl bg-emerald-700 px-4 py-3 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:opacity-50"
+              >
+                {{ approvingFinal ? "Kiadás..." : "Végleges kiadás jóváhagyása" }}
+              </button>
+
+              <div v-if="reportVersions.length" class="mt-4 grid gap-2">
+                <div class="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">Kiadott verziók</div>
+                <article v-for="version in reportVersions" :key="version.id" class="rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs">
+                  <div class="flex items-center justify-between gap-2">
+                    <strong>v{{ version.version }}</strong>
+                    <span :class="version.file_state === 'ok' ? 'text-emerald-700' : 'text-rose-700'" class="font-semibold">
+                      fájl: {{ version.file_state === "ok" ? "ép" : version.file_state }}
+                    </span>
+                  </div>
+                  <div class="mt-1 text-slate-600">{{ version.approved_by }} · {{ version.approved_at }}</div>
+                  <div class="mt-1 break-all font-mono text-[10px] text-slate-500">pillanatkép: {{ version.snapshot_hash }}</div>
+                </article>
+              </div>
+            </div>
 
             <div v-if="reportSaved" class="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
               Riport mentve: <span class="break-all font-mono text-xs">{{ reportPath }}</span>
